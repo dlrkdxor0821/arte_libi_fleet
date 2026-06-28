@@ -1,0 +1,5 @@
+# vendor robot packages (pinky_pro) — URDF/메시는 디스크에서 사용, 커밋 제외
+controller/libi_drive_controller/src/pinky_pro/
+
+# 설계/브레인스토밍 산출물 (커밋 제외)
+docs/superpowers/
