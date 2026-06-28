@@ -1,0 +1,7 @@
+string dispatcher   # libi_fleet::GreedyCost | libi_fleet::FarthestCost
+string traffic      # libi_fleet::EdgeNodeLock | libi_fleet::NoLock
+---
+bool ok
+string active_dispatcher
+string active_traffic
+string reason

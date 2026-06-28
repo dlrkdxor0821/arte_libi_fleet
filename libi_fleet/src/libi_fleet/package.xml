@@ -13,6 +13,7 @@
   <depend>libi_fleet_msgs</depend>
   <depend>rmf_fleet_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>yaml-cpp</depend>
 
   <export>

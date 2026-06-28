@@ -8,7 +8,9 @@
 #include <pluginlib/class_loader.hpp>
 
 #include <libi_fleet_msgs/srv/submit_task.hpp>
+#include <libi_fleet_msgs/srv/set_plugins.hpp>
 #include <libi_fleet_msgs/msg/task_state.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <rmf_fleet_msgs/msg/robot_state.hpp>
 #include <rmf_fleet_msgs/msg/path_request.hpp>
 #include <rmf_fleet_msgs/msg/location.hpp>
@@ -19,6 +21,7 @@
 #include "libi_fleet/traffic_base.hpp"
 
 using SubmitTask = libi_fleet_msgs::srv::SubmitTask;
+using SetPlugins = libi_fleet_msgs::srv::SetPlugins;
 using TaskState = libi_fleet_msgs::msg::TaskState;
 using RmfRobotState = rmf_fleet_msgs::msg::RobotState;
 using PathRequest = rmf_fleet_msgs::msg::PathRequest;
@@ -47,16 +50,18 @@ public:
     disp_loader_("libi_fleet", "libi_fleet::DispatcherBase"),
     traf_loader_("libi_fleet", "libi_fleet::TrafficBase")
   {
-    const std::string navgraph_file = declare_parameter<std::string>("navgraph_file", "");
+    navgraph_file_ = declare_parameter<std::string>("navgraph_file", "");
     const std::string disp_name = declare_parameter<std::string>("dispatcher_plugin", "libi_fleet::GreedyCost");
     const std::string traf_name = declare_parameter<std::string>("traffic_plugin", "libi_fleet::EdgeNodeLock");
     const std::string fleet = declare_parameter<std::string>("fleet_name", "libi");
     fleet_name_ = fleet;
 
-    if (!graph_.load(navgraph_file)) {
-      RCLCPP_FATAL(get_logger(), "navgraph 로드 실패: %s", navgraph_file.c_str());
+    if (!graph_.load(navgraph_file_)) {
+      RCLCPP_FATAL(get_logger(), "navgraph 로드 실패: %s", navgraph_file_.c_str());
       throw std::runtime_error("navgraph load failed");
     }
+    active_disp_ = disp_name;
+    active_traf_ = traf_name;
     dispatcher_ = disp_loader_.createSharedInstance(disp_name);
     traffic_ = traf_loader_.createSharedInstance(traf_name);
     RCLCPP_INFO(get_logger(), "plugins: dispatcher=%s traffic=%s | navgraph=%d verts",
@@ -71,6 +76,12 @@ public:
     srv_ = create_service<SubmitTask>(
       "/fms/submit_task",
       std::bind(&FleetNode::on_submit, this, std::placeholders::_1, std::placeholders::_2));
+    plugins_srv_ = create_service<SetPlugins>(
+      "/fms/set_plugins",
+      std::bind(&FleetNode::on_set_plugins, this, std::placeholders::_1, std::placeholders::_2));
+    reload_srv_ = create_service<std_srvs::srv::Trigger>(
+      "/fms/reload_navgraph",
+      std::bind(&FleetNode::on_reload, this, std::placeholders::_1, std::placeholders::_2));
 
     timer_ = create_wall_timer(std::chrono::milliseconds(250),
                                std::bind(&FleetNode::on_timer, this));
@@ -115,9 +126,17 @@ private:
     if (goal < 0 || goal >= graph_.size()) {
       res->accepted = false; res->reason = "bad_goal_vertex"; return;
     }
-    std::vector<RobotInfo> snapshot;
-    for (const auto & kv : robots_) { snapshot.push_back(kv.second); }
-    std::string robot = dispatcher_->assign(goal, snapshot, graph_);
+    std::string robot;
+    if (!req->robot.empty()) {              // 특정 로봇 강제 배정
+      auto it = robots_.find(req->robot);
+      if (it == robots_.end()) { res->accepted = false; res->reason = "unknown_robot"; return; }
+      if (it->second.busy) { res->accepted = false; res->reason = "robot_busy"; return; }
+      robot = req->robot;
+    } else {                                // dispatcher 가 선택
+      std::vector<RobotInfo> snapshot;
+      for (const auto & kv : robots_) { snapshot.push_back(kv.second); }
+      robot = dispatcher_->assign(goal, snapshot, graph_);
+    }
     if (robot.empty()) {
       res->accepted = false; res->reason = "no_robot_available"; return;
     }
@@ -178,13 +197,53 @@ private:
     }
   }
 
+  void on_set_plugins(const std::shared_ptr<SetPlugins::Request> req,
+                      std::shared_ptr<SetPlugins::Response> res)
+  {
+    try {
+      if (!req->dispatcher.empty()) {
+        dispatcher_ = disp_loader_.createSharedInstance(req->dispatcher);
+        active_disp_ = req->dispatcher;
+      }
+      if (!req->traffic.empty()) {
+        traffic_ = traf_loader_.createSharedInstance(req->traffic);  // 잠금상태 초기화(테스트는 idle 시 스왑)
+        active_traf_ = req->traffic;
+      }
+      res->ok = true;
+    } catch (const std::exception & e) {
+      res->ok = false; res->reason = e.what();
+    }
+    res->active_dispatcher = active_disp_;
+    res->active_traffic = active_traf_;
+    RCLCPP_INFO(get_logger(), "set_plugins → dispatcher=%s traffic=%s (ok=%d)",
+                active_disp_.c_str(), active_traf_.c_str(), res->ok ? 1 : 0);
+  }
+
+  void on_reload(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                 std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+  {
+    Navgraph g;
+    if (g.load(navgraph_file_)) {
+      graph_ = g;
+      res->success = true;
+      res->message = "reloaded " + std::to_string(graph_.size()) + " vertices";
+      RCLCPP_INFO(get_logger(), "navgraph 리로드: %d 정점", graph_.size());
+    } else {
+      res->success = false;
+      res->message = "load failed";
+    }
+  }
+
   // plugins
   pluginlib::ClassLoader<DispatcherBase> disp_loader_;
   pluginlib::ClassLoader<TrafficBase> traf_loader_;
   std::shared_ptr<DispatcherBase> dispatcher_;
   std::shared_ptr<TrafficBase> traffic_;
+  std::string active_disp_;
+  std::string active_traf_;
 
   Navgraph graph_;
+  std::string navgraph_file_;
   std::string fleet_name_;
   std::map<std::string, RobotInfo> robots_;
   std::vector<ActiveTask> tasks_;
@@ -195,6 +254,8 @@ private:
   rclcpp::Publisher<PathRequest>::SharedPtr path_pub_;
   rclcpp::Publisher<TaskState>::SharedPtr task_pub_;
   rclcpp::Service<SubmitTask>::SharedPtr srv_;
+  rclcpp::Service<SetPlugins>::SharedPtr plugins_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reload_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

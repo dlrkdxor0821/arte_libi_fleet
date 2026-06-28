@@ -1,7 +1,8 @@
 string task_type    # delivery|sorting|guide|patrol
 string pickup
-string dropoff
+string dropoff      # goal vertex index
 string requester
+string robot        # optional: 강제 배정할 로봇(비우면 dispatcher)
 ---
 bool accepted
 string task_id

@@ -10,6 +10,7 @@ find_package(pluginlib REQUIRED)
 find_package(libi_fleet_msgs REQUIRED)
 find_package(rmf_fleet_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 # --- core 라이브러리 (navgraph) ---
@@ -40,7 +41,7 @@ target_include_directories(fleet_node PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(fleet_node libi_fleet_core)
 ament_target_dependencies(fleet_node
-  rclcpp pluginlib libi_fleet_msgs rmf_fleet_msgs geometry_msgs)
+  rclcpp pluginlib libi_fleet_msgs rmf_fleet_msgs geometry_msgs std_srvs)
 
 install(TARGETS libi_fleet_core libi_fleet_plugins
   ARCHIVE DESTINATION lib
