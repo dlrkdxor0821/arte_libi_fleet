@@ -1,0 +1,42 @@
+<?xml version='1.0' ?>
+<!-- headless slotcar bring-up (open-rmf-practice launch_sim 기반, GUI 제거 + building_map_server 추가).
+     slotcar 1대 스폰 + building_map_server(L1 인식 → /robot_state 발행). -->
+<launch>
+    <arg name="robot_name" default="pinky"/>
+    <arg name="world_name" default="new_map.sdf"/>
+    <arg name="world" default="$(find-pkg-share pinky_gz_sim)/worlds/$(var world_name)"/>
+    <arg name="bridge_params" default="$(find-pkg-share pinky_gz_sim)/params/pinky_bridge.yaml"/>
+    <arg name="building_yaml"/>
+    <arg name="spawn_x" default="0.43"/>
+    <arg name="spawn_y" default="9.87"/>
+    <arg name="spawn_z" default="0.1"/>
+
+    <set_env name="GZ_SIM_RESOURCE_PATH" value="$(find-pkg-share pinky_description)/../:/$(find-pkg-share pinky_gz_sim)/models:/$(env HOME)/.gazebo/models"/>
+    <set_env name="GZ_SIM_SYSTEM_PLUGIN_PATH" value="/opt/ros/jazzy/lib/rmf_robot_sim_gz_plugins:$(env GZ_SIM_SYSTEM_PLUGIN_PATH '')"/>
+
+    <!-- building_map_server: building.yaml 의 level(L1) 을 발행 → slotcar 가 /robot_state 발행 -->
+    <node pkg="rmf_building_map_tools" exec="building_map_server" name="building_map_server"
+          args="$(var building_yaml)" output="screen"/>
+
+    <!-- gz 서버만 (headless, GUI 없음) -->
+    <include file="$(find-pkg-share ros_gz_sim)/launch/gz_sim.launch.py">
+        <arg name='gz_args' value='-r -s -v3 $(var world)'/>
+        <arg name='on_exit_shutdown' value='true'/>
+    </include>
+
+    <!-- slotcar robot_description -->
+    <include file="$(find-pkg-share pinky_description)/launch/upload_robot.launch.py">
+        <arg name='use_sim_time' value='True'/>
+        <arg name='is_sim' value='True'/>
+        <arg name='drive' value='slotcar'/>
+    </include>
+
+    <!-- 스폰 (navgraph 정점 위) -->
+    <node pkg="ros_gz_sim" exec="create" name='create' output='screen'
+          args="-name $(var robot_name) -topic /robot_description -x $(var spawn_x) -y $(var spawn_y) -z $(var spawn_z)">
+        <param name='use_sim_time' value='True'/>
+    </node>
+
+    <node pkg="ros_gz_bridge" exec="parameter_bridge" name='parameter_bridge' output='screen'
+          args="--ros-args -p config_file:=$(var bridge_params)"/>
+</launch>
