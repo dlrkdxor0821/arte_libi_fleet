@@ -1,0 +1,7 @@
+string[] path
+geometry_msgs/Pose target
+---
+bool arrived
+string error
+---
+float32 progress

@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>libi_drive</name>
+  <version>0.0.1</version>
+  <description>Libi Drive Controller (robot representative)</description>
+  <maintainer email="dlrkdxor0821@gmail.com">leekt</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>libi_fleet_msgs</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -3,3 +3,8 @@ controller/libi_drive_controller/src/pinky_pro/
 
 # 설계/브레인스토밍 산출물 (커밋 제외)
 docs/superpowers/
+
+# ROS 2 / colcon 빌드 산출물
+build/
+install/
+log/

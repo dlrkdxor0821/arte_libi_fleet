@@ -1,0 +1,7 @@
+string action
+string params
+---
+bool success
+string error
+---
+string phase

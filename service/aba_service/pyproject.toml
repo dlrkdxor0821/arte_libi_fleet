@@ -1,0 +1,12 @@
+[project]
+name = "aba_service"
+version = "0.0.1"
+description = "ABA central control entry (FastAPI) bridging UI to libi_fleet"
+requires-python = ">=3.10"
+dependencies = ["fastapi", "uvicorn", "httpx<0.28"]  # httpx>=0.28 drops app= used by system starlette TestClient
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["aba_service*"]
