@@ -1,0 +1,14 @@
+<library path="libi_fleet_plugins">
+  <class type="libi_fleet::GreedyCost" base_class_type="libi_fleet::DispatcherBase">
+    <description>Greedy + cost-function dispatcher (instantaneous assignment).</description>
+  </class>
+  <class type="libi_fleet::FarthestCost" base_class_type="libi_fleet::DispatcherBase">
+    <description>Farthest-robot dispatcher (experiment control group, opposite of greedy).</description>
+  </class>
+  <class type="libi_fleet::EdgeNodeLock" base_class_type="libi_fleet::TrafficBase">
+    <description>Edge/node lock traffic manager (mutex per navgraph node).</description>
+  </class>
+  <class type="libi_fleet::NoLock" base_class_type="libi_fleet::TrafficBase">
+    <description>No traffic control (always grant) — experiment control group.</description>
+  </class>
+</library>

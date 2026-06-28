@@ -1,42 +1,209 @@
+#include <cmath>
+#include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <pluginlib/class_loader.hpp>
+
 #include <libi_fleet_msgs/srv/submit_task.hpp>
+#include <libi_fleet_msgs/msg/task_state.hpp>
+#include <rmf_fleet_msgs/msg/robot_state.hpp>
+#include <rmf_fleet_msgs/msg/path_request.hpp>
+#include <rmf_fleet_msgs/msg/location.hpp>
+
+#include "libi_fleet/navgraph.hpp"
+#include "libi_fleet/fms_types.hpp"
+#include "libi_fleet/dispatcher_base.hpp"
+#include "libi_fleet/traffic_base.hpp"
 
 using SubmitTask = libi_fleet_msgs::srv::SubmitTask;
+using TaskState = libi_fleet_msgs::msg::TaskState;
+using RmfRobotState = rmf_fleet_msgs::msg::RobotState;
+using PathRequest = rmf_fleet_msgs::msg::PathRequest;
+using RmfLocation = rmf_fleet_msgs::msg::Location;
 
-// Plan 1 스켈레톤: SubmitTask 를 무조건 accept 하는 스텁.
-// (Plan 3 에서 TaskManager + Dispatcher pluginlib 로 교체)
+namespace libi_fleet
+{
+
+constexpr double kArrive = 0.35;   // 도착 판정 거리(m)
+
+struct ActiveTask
+{
+  std::string id;
+  std::string robot;
+  std::vector<int> path;   // 정점 인덱스 경로(시작 포함)
+  size_t idx{1};           // 현재 향하는 path 인덱스
+  bool moving{false};
+  bool wait_logged{false};
+};
+
 class FleetNode : public rclcpp::Node
 {
 public:
   FleetNode()
-  : rclcpp::Node("libi_fleet")
+  : rclcpp::Node("libi_fleet"),
+    disp_loader_("libi_fleet", "libi_fleet::DispatcherBase"),
+    traf_loader_("libi_fleet", "libi_fleet::TrafficBase")
   {
+    const std::string navgraph_file = declare_parameter<std::string>("navgraph_file", "");
+    const std::string disp_name = declare_parameter<std::string>("dispatcher_plugin", "libi_fleet::GreedyCost");
+    const std::string traf_name = declare_parameter<std::string>("traffic_plugin", "libi_fleet::EdgeNodeLock");
+    const std::string fleet = declare_parameter<std::string>("fleet_name", "libi");
+    fleet_name_ = fleet;
+
+    if (!graph_.load(navgraph_file)) {
+      RCLCPP_FATAL(get_logger(), "navgraph 로드 실패: %s", navgraph_file.c_str());
+      throw std::runtime_error("navgraph load failed");
+    }
+    dispatcher_ = disp_loader_.createSharedInstance(disp_name);
+    traffic_ = traf_loader_.createSharedInstance(traf_name);
+    RCLCPP_INFO(get_logger(), "plugins: dispatcher=%s traffic=%s | navgraph=%d verts",
+                disp_name.c_str(), traf_name.c_str(), graph_.size());
+
+    state_sub_ = create_subscription<RmfRobotState>(
+      "/robot_state", 10,
+      std::bind(&FleetNode::on_robot_state, this, std::placeholders::_1));
+    path_pub_ = create_publisher<PathRequest>("/robot_path_requests", rclcpp::QoS(10).reliable());
+    task_pub_ = create_publisher<TaskState>("/fms/task_states", 10);
+
     srv_ = create_service<SubmitTask>(
       "/fms/submit_task",
-      [this](const std::shared_ptr<SubmitTask::Request> req,
-             std::shared_ptr<SubmitTask::Response> res) {
-        res->accepted = true;
-        res->task_id = "T-" + std::to_string(++counter_);
-        res->reason = "";
-        RCLCPP_INFO(
-          get_logger(), "SubmitTask stub: type=%s -> %s",
-          req->task_type.c_str(), res->task_id.c_str());
-      });
-    RCLCPP_INFO(get_logger(), "libi_fleet skeleton up (stub /fms/submit_task)");
+      std::bind(&FleetNode::on_submit, this, std::placeholders::_1, std::placeholders::_2));
+
+    timer_ = create_wall_timer(std::chrono::milliseconds(250),
+                               std::bind(&FleetNode::on_timer, this));
+    RCLCPP_INFO(get_logger(), "libi_fleet FMS up");
   }
 
 private:
+  void on_robot_state(const RmfRobotState::SharedPtr msg)
+  {
+    auto & r = robots_[msg->name];
+    r.name = msg->name;
+    r.x = msg->location.x;
+    r.y = msg->location.y;
+  }
+
+  void publish_task_state(const std::string & id, const std::string & state, const std::string & robot)
+  {
+    TaskState ts;
+    ts.task_id = id;
+    ts.state = state;
+    ts.robot_id = robot;
+    task_pub_->publish(ts);
+  }
+
+  void send_path(const std::string & robot, double x0, double y0, const Vertex & target)
+  {
+    PathRequest req;
+    req.fleet_name = fleet_name_;
+    req.robot_name = robot;
+    req.task_id = robot + "-" + std::to_string(++path_seq_);   // 고유 task_id (slotcar dedup 회피)
+    RmfLocation p0; p0.x = x0; p0.y = y0; p0.level_name = "L1";
+    RmfLocation p1; p1.x = target.x; p1.y = target.y; p1.level_name = "L1";
+    req.path = {p0, p1};
+    path_pub_->publish(req);
+  }
+
+  void on_submit(const std::shared_ptr<SubmitTask::Request> req,
+                 std::shared_ptr<SubmitTask::Response> res)
+  {
+    int goal = -1;
+    try { goal = std::stoi(req->dropoff); } catch (...) { goal = -1; }
+    if (goal < 0 || goal >= graph_.size()) {
+      res->accepted = false; res->reason = "bad_goal_vertex"; return;
+    }
+    std::vector<RobotInfo> snapshot;
+    for (const auto & kv : robots_) { snapshot.push_back(kv.second); }
+    std::string robot = dispatcher_->assign(goal, snapshot, graph_);
+    if (robot.empty()) {
+      res->accepted = false; res->reason = "no_robot_available"; return;
+    }
+    auto & r = robots_[robot];
+    int start = graph_.nearest(r.x, r.y);
+    auto path = graph_.dijkstra(start, goal);
+    if (path.size() < 2) {
+      res->accepted = false; res->reason = "no_path"; return;
+    }
+    r.busy = true;
+    std::string tid = "T-" + std::to_string(++task_counter_);
+    r.task_id = tid;
+    ActiveTask t; t.id = tid; t.robot = robot; t.path = path; t.idx = 1; t.moving = false;
+    traffic_->request_move(robot, path[0]);   // 시작 노드 점유
+    tasks_.push_back(t);
+    res->accepted = true; res->task_id = tid; res->reason = "";
+    publish_task_state(tid, "ASSIGNED", robot);
+    RCLCPP_INFO(get_logger(), "[%s] %s 배차 → goal v%d, path %zu nodes",
+                tid.c_str(), robot.c_str(), goal, path.size());
+  }
+
+  void on_timer()
+  {
+    for (auto it = tasks_.begin(); it != tasks_.end();) {
+      ActiveTask & t = *it;
+      RobotInfo & r = robots_[t.robot];
+      const Vertex & tv = graph_.vertex(t.path[t.idx]);
+      double d = std::hypot(r.x - tv.x, r.y - tv.y);
+
+      if (t.moving && d < kArrive) {
+        traffic_->release(t.robot, t.path[t.idx - 1]);   // 직전 노드 해제
+        RCLCPP_INFO(get_logger(), "[%s] %s 도착 v%d", t.id.c_str(), t.robot.c_str(), t.path[t.idx]);
+        t.idx++;
+        t.moving = false;
+        if (t.idx >= t.path.size()) {
+          traffic_->release(t.robot, t.path.back());     // 최종 노드 해제
+          r.busy = false; r.task_id.clear();
+          publish_task_state(t.id, "COMPLETED", t.robot);
+          RCLCPP_INFO(get_logger(), "[%s] %s 작업 완료", t.id.c_str(), t.robot.c_str());
+          it = tasks_.erase(it);
+          continue;
+        }
+      }
+
+      if (!t.moving) {
+        int next = t.path[t.idx];
+        if (traffic_->request_move(t.robot, next) == MoveDecision::GRANT) {
+          send_path(t.robot, r.x, r.y, graph_.vertex(next));
+          t.moving = true; t.wait_logged = false;
+          RCLCPP_INFO(get_logger(), "[%s] %s → v%d (GRANT)", t.id.c_str(), t.robot.c_str(), next);
+        } else if (!t.wait_logged) {
+          publish_task_state(t.id, "EXECUTING", t.robot);
+          RCLCPP_WARN(get_logger(), "[%s] %s ⏸ v%d 점유중 → 양보 대기", t.id.c_str(), t.robot.c_str(), next);
+          t.wait_logged = true;
+        }
+      }
+      ++it;
+    }
+  }
+
+  // plugins
+  pluginlib::ClassLoader<DispatcherBase> disp_loader_;
+  pluginlib::ClassLoader<TrafficBase> traf_loader_;
+  std::shared_ptr<DispatcherBase> dispatcher_;
+  std::shared_ptr<TrafficBase> traffic_;
+
+  Navgraph graph_;
+  std::string fleet_name_;
+  std::map<std::string, RobotInfo> robots_;
+  std::vector<ActiveTask> tasks_;
+  int task_counter_{0};
+  int path_seq_{0};
+
+  rclcpp::Subscription<RmfRobotState>::SharedPtr state_sub_;
+  rclcpp::Publisher<PathRequest>::SharedPtr path_pub_;
+  rclcpp::Publisher<TaskState>::SharedPtr task_pub_;
   rclcpp::Service<SubmitTask>::SharedPtr srv_;
-  int counter_{0};
+  rclcpp::TimerBase::SharedPtr timer_;
 };
+
+}  // namespace libi_fleet
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<FleetNode>());
+  rclcpp::spin(std::make_shared<libi_fleet::FleetNode>());
   rclcpp::shutdown();
   return 0;
 }
