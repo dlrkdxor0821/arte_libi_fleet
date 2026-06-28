@@ -26,7 +26,9 @@ add_library(libi_fleet_plugins SHARED
   plugins/greedy_cost.cpp
   plugins/farthest_cost.cpp
   plugins/edge_node_lock.cpp
-  plugins/no_lock.cpp)
+  plugins/no_lock.cpp
+  plugins/dispatch_more.cpp
+  plugins/traffic_more.cpp)
 target_include_directories(libi_fleet_plugins PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)

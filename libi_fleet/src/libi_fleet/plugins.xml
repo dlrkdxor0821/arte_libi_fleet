@@ -5,10 +5,37 @@
   <class type="libi_fleet::FarthestCost" base_class_type="libi_fleet::DispatcherBase">
     <description>Farthest-robot dispatcher (experiment control group, opposite of greedy).</description>
   </class>
+  <class type="libi_fleet::Hungarian" base_class_type="libi_fleet::DispatcherBase">
+    <description>Hungarian (Kuhn-Munkres) batch 1:1 optimal matching. Needs task queue.</description>
+  </class>
+  <class type="libi_fleet::Auction" base_class_type="libi_fleet::DispatcherBase">
+    <description>Auction / SSI lowest-bid dispatch. Needs task queue.</description>
+  </class>
+  <class type="libi_fleet::Cbba" base_class_type="libi_fleet::DispatcherBase">
+    <description>CBBA consensus-based bundle (distributed). Needs task queue.</description>
+  </class>
+  <class type="libi_fleet::Milp" base_class_type="libi_fleet::DispatcherBase">
+    <description>MILP / VRP mathematical optimization. Needs task queue.</description>
+  </class>
+  <class type="libi_fleet::GaAco" base_class_type="libi_fleet::DispatcherBase">
+    <description>GA / ACO metaheuristic. Needs task queue.</description>
+  </class>
   <class type="libi_fleet::EdgeNodeLock" base_class_type="libi_fleet::TrafficBase">
     <description>Edge/node lock traffic manager (mutex per navgraph node).</description>
   </class>
   <class type="libi_fleet::NoLock" base_class_type="libi_fleet::TrafficBase">
     <description>No traffic control (always grant) — experiment control group.</description>
+  </class>
+  <class type="libi_fleet::Priority" base_class_type="libi_fleet::TrafficBase">
+    <description>Priority-based negotiation — higher priority robot takes contested node.</description>
+  </class>
+  <class type="libi_fleet::DijkstraReservation" base_class_type="libi_fleet::TrafficBase">
+    <description>Dijkstra + node reservation (+DFS deadlock, future).</description>
+  </class>
+  <class type="libi_fleet::CbsAstar" base_class_type="libi_fleet::TrafficBase">
+    <description>CBS + space-time A* (precomputed, needs path-reservation interface).</description>
+  </class>
+  <class type="libi_fleet::Orca" base_class_type="libi_fleet::TrafficBase">
+    <description>ORCA / VO velocity-space avoidance (needs velocity interface).</description>
   </class>
 </library>

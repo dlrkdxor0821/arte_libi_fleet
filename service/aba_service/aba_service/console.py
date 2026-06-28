@@ -367,9 +367,24 @@ td{padding:4px;border-bottom:1px solid #0d2438}
     <div class="grp">
       <div class="ey">알고리즘 (런타임 스왑)</div>
       <label>배차 dispatcher</label>
-      <select id="disp"><option value="libi_fleet::GreedyCost">GreedyCost · 최근접</option><option value="libi_fleet::FarthestCost">FarthestCost · 최원거리</option></select>
+      <select id="disp">
+        <option value="libi_fleet::GreedyCost">GreedyCost · 최근접</option>
+        <option value="libi_fleet::FarthestCost">FarthestCost · 최원거리</option>
+        <option value="libi_fleet::Hungarian">Hungarian · 최적매칭 (batch)</option>
+        <option value="libi_fleet::Auction">Auction/SSI · 경매 (batch)</option>
+        <option value="libi_fleet::Cbba">CBBA · 묶음합의 (batch)</option>
+        <option value="libi_fleet::Milp">MILP/VRP · 수리최적 (batch)</option>
+        <option value="libi_fleet::GaAco">GA/ACO · 메타휴리스틱 (batch)</option>
+      </select>
       <label>교통 traffic</label>
-      <select id="traf"><option value="libi_fleet::EdgeNodeLock">EdgeNodeLock · 양보 ON</option><option value="libi_fleet::NoLock">NoLock · 양보 OFF</option></select>
+      <select id="traf">
+        <option value="libi_fleet::EdgeNodeLock">EdgeNodeLock · 양보 ON</option>
+        <option value="libi_fleet::NoLock">NoLock · 양보 OFF</option>
+        <option value="libi_fleet::Priority">Priority · 우선순위 양보</option>
+        <option value="libi_fleet::DijkstraReservation">Dijkstra+노드예약</option>
+        <option value="libi_fleet::CbsAstar">CBS+A* · 경로예약 (추후)</option>
+        <option value="libi_fleet::Orca">ORCA/VO · 속도양보 (추후)</option>
+      </select>
       <div class="btns"><button class="warn" onclick="applyPlugins()">알고리즘 적용</button></div>
     </div>
     <div class="grp">
