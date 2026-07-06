@@ -1,6 +1,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -9,8 +10,10 @@
 
 #include <libi_fleet_msgs/srv/submit_task.hpp>
 #include <libi_fleet_msgs/srv/set_plugins.hpp>
+#include <libi_fleet_msgs/srv/set_robot_mode.hpp>
 #include <libi_fleet_msgs/msg/task_state.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <rmf_fleet_msgs/msg/robot_state.hpp>
 #include <rmf_fleet_msgs/msg/path_request.hpp>
 #include <rmf_fleet_msgs/msg/location.hpp>
@@ -22,6 +25,7 @@
 
 using SubmitTask = libi_fleet_msgs::srv::SubmitTask;
 using SetPlugins = libi_fleet_msgs::srv::SetPlugins;
+using SetRobotMode = libi_fleet_msgs::srv::SetRobotMode;
 using TaskState = libi_fleet_msgs::msg::TaskState;
 using RmfRobotState = rmf_fleet_msgs::msg::RobotState;
 using PathRequest = rmf_fleet_msgs::msg::PathRequest;
@@ -40,6 +44,8 @@ struct ActiveTask
   size_t idx{1};           // 현재 향하는 path 인덱스
   bool moving{false};
   bool wait_logged{false};
+  bool patrol{false};      // 순회 task: 끝에 도달해도 완료 안 하고 루프 반복
+  int priority{0};         // task 우선순위(높을수록 우선). 교착 시 낮은 쪽이 양보.
 };
 
 class FleetNode : public rclcpp::Node
@@ -51,10 +57,15 @@ public:
     traf_loader_("libi_fleet", "libi_fleet::TrafficBase")
   {
     navgraph_file_ = declare_parameter<std::string>("navgraph_file", "");
-    const std::string disp_name = declare_parameter<std::string>("dispatcher_plugin", "libi_fleet::GreedyCost");
-    const std::string traf_name = declare_parameter<std::string>("traffic_plugin", "libi_fleet::EdgeNodeLock");
+    const std::string disp_name = declare_parameter<std::string>("dispatcher_plugin", "libi_fleet::Auction");
+    const std::string traf_name = declare_parameter<std::string>("traffic_plugin", "libi_fleet::ReservationDeadlock");
     const std::string fleet = declare_parameter<std::string>("fleet_name", "libi");
     fleet_name_ = fleet;
+
+    // 순회(patrol) 모드: 켜지면 idle 로봇이 patrol_route(외곽 루프)를 무한 순회.
+    patrol_ = declare_parameter<bool>("patrol", true);
+    const std::string route_s = declare_parameter<std::string>("patrol_route", "0 1 2 3 7 6 5 4");
+    { std::stringstream ss(route_s); int v; while (ss >> v) { patrol_route_.push_back(v); } }
 
     if (!graph_.load(navgraph_file_)) {
       RCLCPP_FATAL(get_logger(), "navgraph 로드 실패: %s", navgraph_file_.c_str());
@@ -72,6 +83,7 @@ public:
       std::bind(&FleetNode::on_robot_state, this, std::placeholders::_1));
     path_pub_ = create_publisher<PathRequest>("/robot_path_requests", rclcpp::QoS(10).reliable());
     task_pub_ = create_publisher<TaskState>("/fms/task_states", 10);
+    occ_pub_ = create_publisher<std_msgs::msg::String>("/fms/occupancy", 10);
 
     srv_ = create_service<SubmitTask>(
       "/fms/submit_task",
@@ -82,6 +94,9 @@ public:
     reload_srv_ = create_service<std_srvs::srv::Trigger>(
       "/fms/reload_navgraph",
       std::bind(&FleetNode::on_reload, this, std::placeholders::_1, std::placeholders::_2));
+    mode_srv_ = create_service<SetRobotMode>(
+      "/fms/set_robot_mode",
+      std::bind(&FleetNode::on_set_mode, this, std::placeholders::_1, std::placeholders::_2));
 
     timer_ = create_wall_timer(std::chrono::milliseconds(250),
                                std::bind(&FleetNode::on_timer, this));
@@ -95,6 +110,9 @@ private:
     r.name = msg->name;
     r.x = msg->location.x;
     r.y = msg->location.y;
+    if (robot_mode_.find(msg->name) == robot_mode_.end()) {
+      robot_mode_[msg->name] = patrol_ ? "PATROL" : "IDLE";   // 최초 관측 시 기본 모드
+    }
   }
 
   void publish_task_state(const std::string & id, const std::string & state, const std::string & robot)
@@ -130,11 +148,14 @@ private:
     if (!req->robot.empty()) {              // 특정 로봇 강제 배정
       auto it = robots_.find(req->robot);
       if (it == robots_.end()) { res->accepted = false; res->reason = "unknown_robot"; return; }
+      if (mode_of(req->robot) == "STOP") { res->accepted = false; res->reason = "robot_stopped"; return; }
       if (it->second.busy) { res->accepted = false; res->reason = "robot_busy"; return; }
       robot = req->robot;
-    } else {                                // dispatcher 가 선택
+    } else {                                // dispatcher 가 선택 (STOP 로봇 제외)
       std::vector<RobotInfo> snapshot;
-      for (const auto & kv : robots_) { snapshot.push_back(kv.second); }
+      for (const auto & kv : robots_) {
+        if (mode_of(kv.first) != "STOP") { snapshot.push_back(kv.second); }
+      }
       robot = dispatcher_->assign(goal, snapshot, graph_);
     }
     if (robot.empty()) {
@@ -150,7 +171,8 @@ private:
     std::string tid = "T-" + std::to_string(++task_counter_);
     r.task_id = tid;
     ActiveTask t; t.id = tid; t.robot = robot; t.path = path; t.idx = 1; t.moving = false;
-    traffic_->request_move(robot, path[0]);   // 시작 노드 점유
+    t.priority = req->priority;
+    traffic_->request_move(robot, path[0], path[0], t.priority);   // 시작 노드 점유(claim)
     tasks_.push_back(t);
     res->accepted = true; res->task_id = tid; res->reason = "";
     publish_task_state(tid, "ASSIGNED", robot);
@@ -160,6 +182,17 @@ private:
 
   void on_timer()
   {
+    // 순회 모드(per-robot): PATROL 모드 로봇이 task 없으면 외곽 루프 순회 부여
+    if (patrol_route_.size() >= 2) {
+      for (auto & kv : robots_) {
+        RobotInfo & r = kv.second;
+        if (r.busy || mode_of(r.name) != "PATROL") { continue; }
+        bool has = false;
+        for (const auto & t : tasks_) { if (t.robot == r.name) { has = true; break; } }
+        if (!has) { start_patrol(r); }
+      }
+    }
+
     for (auto it = tasks_.begin(); it != tasks_.end();) {
       ActiveTask & t = *it;
       RobotInfo & r = robots_[t.robot];
@@ -167,34 +200,144 @@ private:
       double d = std::hypot(r.x - tv.x, r.y - tv.y);
 
       if (t.moving && d < kArrive) {
-        traffic_->release(t.robot, t.path[t.idx - 1]);   // 직전 노드 해제
+        traffic_->release_edge(t.robot, t.path[t.idx - 1], t.path[t.idx]);   // 지나온 엣지 해제
         RCLCPP_INFO(get_logger(), "[%s] %s 도착 v%d", t.id.c_str(), t.robot.c_str(), t.path[t.idx]);
         t.idx++;
         t.moving = false;
         if (t.idx >= t.path.size()) {
-          traffic_->release(t.robot, t.path.back());     // 최종 노드 해제
-          r.busy = false; r.task_id.clear();
-          publish_task_state(t.id, "COMPLETED", t.robot);
-          RCLCPP_INFO(get_logger(), "[%s] %s 작업 완료", t.id.c_str(), t.robot.c_str());
-          it = tasks_.erase(it);
-          continue;
+          if (t.patrol) {
+            t.idx = 1;   // 루프 계속 (path.back()==path[0] 소유 상태 → 아래 이동블록으로)
+            RCLCPP_INFO(get_logger(), "[%s] %s 순회 1바퀴 → 계속", t.id.c_str(), t.robot.c_str());
+          } else {
+            traffic_->release_node(t.robot, t.path.back());     // 최종 노드 해제
+            r.busy = false; r.task_id.clear();
+            publish_task_state(t.id, "COMPLETED", t.robot);
+            RCLCPP_INFO(get_logger(), "[%s] %s 작업 완료", t.id.c_str(), t.robot.c_str());
+            it = tasks_.erase(it);
+            continue;
+          }
         }
       }
 
       if (!t.moving) {
+        int cur = t.path[t.idx - 1];
         int next = t.path[t.idx];
-        if (traffic_->request_move(t.robot, next) == MoveDecision::GRANT) {
+        MoveDecision dec = traffic_->request_move(t.robot, cur, next, t.priority);
+        if (dec == MoveDecision::GRANT) {
+          traffic_->release_node(t.robot, cur);   // 출발 순간 이전 노드 해제(엣지는 유지)
           send_path(t.robot, r.x, r.y, graph_.vertex(next));
           t.moving = true; t.wait_logged = false;
           RCLCPP_INFO(get_logger(), "[%s] %s → v%d (GRANT)", t.id.c_str(), t.robot.c_str(), next);
-        } else if (!t.wait_logged) {
-          publish_task_state(t.id, "EXECUTING", t.robot);
-          RCLCPP_WARN(get_logger(), "[%s] %s ⏸ v%d 점유중 → 양보 대기", t.id.c_str(), t.robot.c_str(), next);
-          t.wait_logged = true;
+        } else if (dec == MoveDecision::DEADLOCK) {
+          auto reroute = graph_.dijkstra(cur, t.path.back(), next);   // next 를 피해 우회
+          if (reroute.size() >= 2) {
+            RCLCPP_WARN(get_logger(), "[%s] %s ⚠ 교착 감지(v%d) → 우회경로 %zu nodes",
+                        t.id.c_str(), t.robot.c_str(), next, reroute.size());
+            t.path = reroute; t.idx = 1; t.moving = false; t.wait_logged = false;
+          } else if (!t.wait_logged) {
+            publish_task_state(t.id, "EXECUTING", t.robot);
+            RCLCPP_ERROR(get_logger(), "[%s] %s ⚠ 교착 감지(v%d), 우회 불가 → 대기",
+                         t.id.c_str(), t.robot.c_str(), next);
+            t.wait_logged = true;
+          }
+        } else {   // WAIT
+          if (blocked_by_stopped(next)) {   // 정지 로봇(영구 장애물)이 막음 → 우회
+            auto reroute = graph_.dijkstra(cur, t.path.back(), next);
+            if (reroute.size() >= 2) {
+              RCLCPP_WARN(get_logger(), "[%s] %s ⤴ 정지 로봇(v%d) 우회 → %zu nodes",
+                          t.id.c_str(), t.robot.c_str(), next, reroute.size());
+              t.path = reroute; t.idx = 1; t.moving = false; t.wait_logged = false;
+            } else if (!t.wait_logged) {
+              RCLCPP_ERROR(get_logger(), "[%s] %s 정지 로봇(v%d) 막힘, 우회 불가",
+                           t.id.c_str(), t.robot.c_str(), next);
+              t.wait_logged = true;
+            }
+          } else if (!t.wait_logged) {
+            publish_task_state(t.id, "EXECUTING", t.robot);
+            RCLCPP_WARN(get_logger(), "[%s] %s ⏸ v%d 점유중 → 양보 대기", t.id.c_str(), t.robot.c_str(), next);
+            t.wait_logged = true;
+          }
         }
       }
       ++it;
     }
+    publish_occupancy();
+  }
+
+  // 교통 플러그인의 실제 예약(노드→로봇)을 JSON 으로 발행(시각화용).
+  void publish_occupancy()
+  {
+    std::string j = "{";
+    bool first = true;
+    for (const auto & no : traffic_->occupancy()) {
+      if (!first) { j += ","; }
+      j += "\"" + std::to_string(no.first) + "\":\"" + no.second + "\"";
+      first = false;
+    }
+    j += "}";
+    std_msgs::msg::String m; m.data = j;
+    occ_pub_->publish(m);
+  }
+
+  std::string mode_of(const std::string & robot) const
+  {
+    auto it = robot_mode_.find(robot);
+    return it == robot_mode_.end() ? "IDLE" : it->second;
+  }
+
+  // node 가 정지(STOP) 로봇에 점유돼 있으면 true → 영구 장애물이므로 우회 대상.
+  bool blocked_by_stopped(int node) const
+  {
+    for (const auto & no : traffic_->occupancy()) {
+      if (no.first == node && mode_of(no.second) == "STOP") { return true; }
+    }
+    return false;
+  }
+
+  // 로봇의 활성 task 취소: 점유(현재+예약 노드) 해제 후 task 제거, busy 해제.
+  void cancel_task(const std::string & robot)
+  {
+    for (auto it = tasks_.begin(); it != tasks_.end();) {
+      if (it->robot == robot) {
+        if (it->idx >= 1 && it->idx - 1 < it->path.size()) {
+          traffic_->release(robot, it->path[it->idx - 1]);
+        }
+        if (it->idx < it->path.size()) {
+          traffic_->release(robot, it->path[it->idx]);
+        }
+        it = tasks_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    auto r = robots_.find(robot);
+    if (r != robots_.end()) { r->second.busy = false; r->second.task_id.clear(); }
+  }
+
+  // 로봇을 외곽 루프(patrol_route)에 태워 무한 순회 시작.
+  void start_patrol(RobotInfo & r)
+  {
+    size_t k = 0; double bd = 1e18;   // 로봇에서 가장 가까운 순회 정점을 진입점으로
+    for (size_t i = 0; i < patrol_route_.size(); ++i) {
+      const Vertex & v = graph_.vertex(patrol_route_[i]);
+      double dd = std::hypot(r.x - v.x, r.y - v.y);
+      if (dd < bd) { bd = dd; k = i; }
+    }
+    const size_t n = patrol_route_.size();
+    std::vector<int> path;
+    for (size_t i = 0; i < n; ++i) { path.push_back(patrol_route_[(k + i) % n]); }
+    path.push_back(patrol_route_[k]);   // 루프 닫기(마지막==처음)
+
+    r.busy = true;
+    std::string tid = "P-" + r.name;
+    r.task_id = tid;
+    ActiveTask t; t.id = tid; t.robot = r.name; t.path = path;
+    t.idx = 1; t.moving = false; t.patrol = true; t.priority = 0;   // 순회는 최저 우선순위
+    traffic_->request_move(r.name, path[0], path[0], 0);   // 진입점 점유
+    tasks_.push_back(t);
+    publish_task_state(tid, "PATROL", r.name);
+    RCLCPP_INFO(get_logger(), "[%s] %s 순회 시작 (진입 v%d, %zu nodes)",
+                tid.c_str(), r.name.c_str(), patrol_route_[k], n);
   }
 
   void on_set_plugins(const std::shared_ptr<SetPlugins::Request> req,
@@ -234,6 +377,29 @@ private:
     }
   }
 
+  void on_set_mode(const std::shared_ptr<SetRobotMode::Request> req,
+                   std::shared_ptr<SetRobotMode::Response> res)
+  {
+    const std::string & m = req->mode;
+    if (m != "PATROL" && m != "IDLE" && m != "STOP") {
+      res->ok = false; res->reason = "bad_mode"; return;
+    }
+    cancel_task(req->robot);          // 모드 전환 시 현재 task 취소(점유 해제)
+    for (const auto & no : traffic_->occupancy()) {   // 남은 점유(이전 정지 claim 등) 해제
+      if (no.second == req->robot) { traffic_->release(req->robot, no.first); }
+    }
+    robot_mode_[req->robot] = m;      // 미관측 로봇도 저장(관측되면 적용)
+    if (m == "STOP") {                // 정지 로봇은 현재 노드를 장애물로 점유(다른 로봇이 우회)
+      auto it = robots_.find(req->robot);
+      if (it != robots_.end()) {
+        int node = graph_.nearest(it->second.x, it->second.y);
+        traffic_->request_move(req->robot, node, node, 1000000);
+      }
+    }
+    res->ok = true; res->reason = "";
+    RCLCPP_INFO(get_logger(), "로봇 모드: %s → %s", req->robot.c_str(), m.c_str());
+  }
+
   // plugins
   pluginlib::ClassLoader<DispatcherBase> disp_loader_;
   pluginlib::ClassLoader<TrafficBase> traf_loader_;
@@ -245,6 +411,9 @@ private:
   Navgraph graph_;
   std::string navgraph_file_;
   std::string fleet_name_;
+  bool patrol_{false};
+  std::vector<int> patrol_route_;
+  std::map<std::string, std::string> robot_mode_;   // 로봇 → PATROL|IDLE|STOP
   std::map<std::string, RobotInfo> robots_;
   std::vector<ActiveTask> tasks_;
   int task_counter_{0};
@@ -253,9 +422,11 @@ private:
   rclcpp::Subscription<RmfRobotState>::SharedPtr state_sub_;
   rclcpp::Publisher<PathRequest>::SharedPtr path_pub_;
   rclcpp::Publisher<TaskState>::SharedPtr task_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr occ_pub_;
   rclcpp::Service<SubmitTask>::SharedPtr srv_;
   rclcpp::Service<SetPlugins>::SharedPtr plugins_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reload_srv_;
+  rclcpp::Service<SetRobotMode>::SharedPtr mode_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

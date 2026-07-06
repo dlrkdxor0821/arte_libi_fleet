@@ -15,6 +15,7 @@ find_package(yaml-cpp REQUIRED)
 
 # --- core 라이브러리 (navgraph) ---
 add_library(libi_fleet_core src/navgraph.cpp)
+set_property(TARGET libi_fleet_core PROPERTY POSITION_INDEPENDENT_CODE ON)  # shared 플러그인에 링크되므로 PIC
 target_include_directories(libi_fleet_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -23,12 +24,8 @@ ament_target_dependencies(libi_fleet_core rclcpp)
 
 # --- pluginlib 플러그인 (dispatcher/traffic) ---
 add_library(libi_fleet_plugins SHARED
-  plugins/greedy_cost.cpp
-  plugins/farthest_cost.cpp
-  plugins/edge_node_lock.cpp
-  plugins/no_lock.cpp
-  plugins/dispatch_more.cpp
-  plugins/traffic_more.cpp)
+  plugins/auction.cpp
+  plugins/reservation_deadlock.cpp)
 target_include_directories(libi_fleet_plugins PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)

@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RobotState.msg"
   "srv/SubmitTask.srv"
   "srv/SetPlugins.srv"
+  "srv/SetRobotMode.srv"
   "action/Navigate.action"
   "action/PerformAction.action"
   DEPENDENCIES geometry_msgs

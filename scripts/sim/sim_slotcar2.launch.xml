@@ -24,14 +24,14 @@
         <arg name='drive' value='slotcar'/>
     </include>
 
-    <!-- pinky1 @ v0 (교통 데모: goal v4, 경로 v0-v1-v2-v3-v4) -->
+    <!-- pinky1 @ 아일L_상 v0(-6.8,10.2) — 외곽 루프 순회 시작점 -->
     <node pkg="ros_gz_sim" exec="create" name='create1' output='screen'
-          args="-name pinky1 -topic /robot_description -x -3.876 -y 11.209 -z 0.1">
+          args="-name pinky1 -topic /robot_description -x -6.8 -y 10.2 -z 0.1">
         <param name='use_sim_time' value='True'/>
     </node>
-    <!-- pinky2 @ v8 (교통 데모: goal v3, 경로 v8-v7-v2-v3 → v2/v3 공유 → 양보) -->
+    <!-- pinky2 @ 아일R2_상 v3(0.6,10.2) — 반대편 시작점 -->
     <node pkg="ros_gz_sim" exec="create" name='create2' output='screen'
-          args="-name pinky2 -topic /robot_description -x 0.522 -y 0.109 -z 0.1">
+          args="-name pinky2 -topic /robot_description -x 0.6 -y 10.2 -z 0.1">
         <param name='use_sim_time' value='True'/>
     </node>
 

@@ -16,7 +16,8 @@ public:
   const Vertex & vertex(int i) const { return vertices_.at(i); }
   int nearest(double x, double y) const;
   // from→to 정점 인덱스 경로(시작·끝 포함). 경로 없으면 빈 벡터.
-  std::vector<int> dijkstra(int from, int to) const;
+  // avoid>=0 이면 그 정점을 통과하지 않는 경로(데드락 우회용).
+  std::vector<int> dijkstra(int from, int to, int avoid = -1) const;
 
 private:
   std::vector<Vertex> vertices_;

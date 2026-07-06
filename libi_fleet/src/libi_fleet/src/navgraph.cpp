@@ -43,7 +43,7 @@ int Navgraph::nearest(double x, double y) const
   return best;
 }
 
-std::vector<int> Navgraph::dijkstra(int from, int to) const
+std::vector<int> Navgraph::dijkstra(int from, int to, int avoid) const
 {
   const int n = size();
   if (from < 0 || to < 0 || from >= n || to >= n) {
@@ -61,6 +61,7 @@ std::vector<int> Navgraph::dijkstra(int from, int to) const
     if (d > dist[u]) { continue; }
     if (u == to) { break; }
     for (int v : adj_[u]) {
+      if (v == avoid) { continue; }   // 우회 대상 정점 건너뜀
       double w = std::hypot(vertices_[u].x - vertices_[v].x, vertices_[u].y - vertices_[v].y);
       if (dist[u] + w < dist[v]) {
         dist[v] = dist[u] + w;

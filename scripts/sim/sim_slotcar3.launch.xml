@@ -30,16 +30,17 @@
         <arg name='drive' value='slotcar'/>
     </include>
 
+    <!-- 외곽 루프 순회: 세 대를 루프 위 서로 다른 지점에 스폰 -->
     <node pkg="ros_gz_sim" exec="create" name='create1' output='screen'
-          args="-name pinky1 -topic /robot_description -x -3.876 -y 11.209 -z 0.1">
+          args="-name pinky1 -topic /robot_description -x -6.8 -y 10.2 -z 0.1">
         <param name='use_sim_time' value='True'/>
     </node>
     <node pkg="ros_gz_sim" exec="create" name='create2' output='screen'
-          args="-name pinky2 -topic /robot_description -x 0.522 -y 0.109 -z 0.1">
+          args="-name pinky2 -topic /robot_description -x 0.6 -y 10.2 -z 0.1">
         <param name='use_sim_time' value='True'/>
     </node>
     <node pkg="ros_gz_sim" exec="create" name='create3' output='screen'
-          args="-name pinky3 -topic /robot_description -x -3.577 -y 3.307 -z 0.1">
+          args="-name pinky3 -topic /robot_description -x -3.8 -y 3.2 -z 0.1">
         <param name='use_sim_time' value='True'/>
     </node>
 

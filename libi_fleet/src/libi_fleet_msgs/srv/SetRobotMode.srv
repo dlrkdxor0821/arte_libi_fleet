@@ -1,0 +1,5 @@
+string robot        # 대상 로봇
+string mode         # PATROL(순회) | IDLE(대기·배차가능) | STOP(정지)
+---
+bool ok
+string reason

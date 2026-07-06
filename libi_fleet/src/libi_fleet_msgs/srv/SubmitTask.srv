@@ -3,6 +3,7 @@ string pickup
 string dropoff      # goal vertex index
 string requester
 string robot        # optional: 강제 배정할 로봇(비우면 dispatcher)
+int32 priority      # 높을수록 우선. 교착 시 낮은 쪽이 양보/우회. 기본 0.
 ---
 bool accepted
 string task_id
