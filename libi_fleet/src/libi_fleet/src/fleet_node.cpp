@@ -101,6 +101,7 @@ public:
     path_pub_ = create_publisher<PathRequest>("/robot_path_requests", rclcpp::QoS(10).reliable());
     task_pub_ = create_publisher<TaskState>("/fms/task_states", 10);
     occ_pub_ = create_publisher<std_msgs::msg::String>("/fms/occupancy", 10);
+    route_pub_ = create_publisher<std_msgs::msg::String>("/fms/routes", 10);
 
     srv_ = create_service<SubmitTask>(
       "/fms/submit_task",
@@ -296,6 +297,29 @@ private:
       ++it;
     }
     publish_occupancy();
+    publish_routes();
+  }
+
+  // 각 로봇의 남은 경로(현재 노드→목표)를 JSON 으로 발행(시각화용): {"robot":[[x,y],...]}.
+  void publish_routes()
+  {
+    std::string j = "{";
+    bool first = true;
+    for (const auto & t : tasks_) {
+      if (!first) { j += ","; }
+      j += "\"" + t.robot + "\":[";
+      size_t start = t.idx > 0 ? t.idx - 1 : 0;   // 현재 향해 출발한 노드부터
+      for (size_t i = start; i < t.path.size(); ++i) {
+        const Vertex & v = graph_.vertex(t.path[i]);
+        if (i > start) { j += ","; }
+        j += "[" + std::to_string(v.x) + "," + std::to_string(v.y) + "]";
+      }
+      j += "]";
+      first = false;
+    }
+    j += "}";
+    std_msgs::msg::String m; m.data = j;
+    route_pub_->publish(m);
   }
 
   // 교통 플러그인의 실제 예약(노드→로봇)을 JSON 으로 발행(시각화용).
@@ -512,6 +536,7 @@ private:
   rclcpp::Publisher<PathRequest>::SharedPtr path_pub_;
   rclcpp::Publisher<TaskState>::SharedPtr task_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr occ_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr route_pub_;
   rclcpp::Service<SubmitTask>::SharedPtr srv_;
   rclcpp::Service<SetPlugins>::SharedPtr plugins_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reload_srv_;

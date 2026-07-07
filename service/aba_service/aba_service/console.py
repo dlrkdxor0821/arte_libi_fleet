@@ -49,6 +49,7 @@ class Bridge(Node):
         self.robots = {}
         self.paths = {}       # name -> [[x,y],...]  로봇이 지금 향하는 경로 구간
         self.occupancy = {}   # "node" -> robot  (교통 플러그인 실제 예약)
+        self.routes = {}      # robot -> [[x,y],...]  목표까지 남은 경로(FMS 발행)
         self.battery_override = {}   # name -> 표시용 배터리 오버라이드
         self.fleet_mode = {}         # name -> 콘솔이 설정한 fleet 모드(PATROL/IDLE/STOP/CHARGE)
         self.task_log = []
@@ -64,6 +65,7 @@ class Bridge(Node):
         self.create_subscription(TaskState, "/fms/task_states", self._on_task, 10)
         self.create_subscription(PathRequest, "/robot_path_requests", self._on_path, 10)
         self.create_subscription(String, "/fms/occupancy", self._on_occ, 10)
+        self.create_subscription(String, "/fms/routes", self._on_routes, 10)
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
                          durability=DurabilityPolicy.VOLATILE)
         self.path_pub = self.create_publisher(PathRequest, "/robot_path_requests", qos)
@@ -105,6 +107,12 @@ class Bridge(Node):
 
     def _on_path(self, m):
         self.paths[m.robot_name] = [[round(p.x, 3), round(p.y, 3)] for p in m.path]
+
+    def _on_routes(self, m):
+        try:
+            self.routes = json.loads(m.data)
+        except Exception:
+            pass
 
     def _on_occ(self, m):
         try:
@@ -269,7 +277,7 @@ def state():
     robots = {n: {**r, "battery": b.battery_override.get(n, 100),   # 기본 100, UI 설정 시 그 값
                   "fleet_mode": b.fleet_mode.get(n, "")}            # 콘솔이 설정한 fleet 모드
               for n, r in b.robots.items()}
-    return {"robots": robots, "paths": b.paths, "occupancy": b.occupancy,
+    return {"robots": robots, "paths": b.paths, "routes": b.routes, "occupancy": b.occupancy,
             "tasks": b.task_log[-14:][::-1],
             "vertices": b.vertices, "lanes": b.lanes, "active": b.active, "map": b.map_meta}
 
@@ -552,21 +560,22 @@ function draw(){
     ctx.fillStyle=oc?'#eaf6ff':'#6f93ab';ctx.font='11px ui-monospace';ctx.fillText('v'+i,X(p[0])+(oc?22:10),Y(p[1])-(oc?12:7));});
   if(edit&&sel>=0&&v[sel]){ctx.strokeStyle='#ffb65c';ctx.lineWidth=2.4;ctx.beginPath();ctx.arc(X(v[sel][0]),Y(v[sel][1]),12,0,7);ctx.stroke();}
   const cols={pinky1:'#ff5d62',pinky2:'#36d98a',pinky3:'#4ea3ff'};
-  // ── 로봇이 갈 경로: 굵은 글로우 + 흐르는 점선 + 화살촉 + 목표 펄스 ──
+  // ── 로봇이 갈 경로(목표 노드까지 남은 route): 은은한 바탕선 + 흐르는 점선 + 화살촉 + 목표 펄스 ──
+  //    shadowBlur 미사용(캔버스 렉의 주범) → 60fps 에서 가벼움.
   ctx.lineCap='round';ctx.lineJoin='round';
-  for(const[name,pw]of Object.entries(S.paths||{})){
+  for(const[name,pw]of Object.entries(S.routes||{})){
     if(!pw||pw.length<2)continue;
     const c=cols[name]||'#c66bff', pts=pw.map(q=>[X(q[0]),Y(q[1])]);
-    ctx.shadowColor=c;ctx.shadowBlur=20;ctx.strokeStyle=c;ctx.globalAlpha=.30;ctx.lineWidth=12;
+    ctx.strokeStyle=c;ctx.globalAlpha=.20;ctx.lineWidth=8;
     ctx.beginPath();pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.stroke();
-    ctx.globalAlpha=1;ctx.shadowBlur=8;ctx.lineWidth=5;ctx.setLineDash([15,11]);ctx.lineDashOffset=-(now/38)%26;
+    ctx.globalAlpha=.95;ctx.lineWidth=3;ctx.setLineDash([12,9]);ctx.lineDashOffset=-(now/45)%21;
     ctx.beginPath();pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.stroke();
-    ctx.setLineDash([]);ctx.shadowBlur=0;
+    ctx.setLineDash([]);ctx.globalAlpha=1;
     const a=pts[pts.length-2],b=pts[pts.length-1],ang=Math.atan2(b[1]-a[1],b[0]-a[0]);
     ctx.fillStyle=c;ctx.beginPath();ctx.moveTo(b[0],b[1]);
-    ctx.lineTo(b[0]-16*Math.cos(ang-.42),b[1]-16*Math.sin(ang-.42));
-    ctx.lineTo(b[0]-16*Math.cos(ang+.42),b[1]-16*Math.sin(ang+.42));ctx.closePath();ctx.fill();
-    ctx.strokeStyle=c;ctx.globalAlpha=.85;ctx.lineWidth=2.4;ctx.beginPath();ctx.arc(b[0],b[1],7+3.5*Math.sin(now/240),0,7);ctx.stroke();ctx.globalAlpha=1;
+    ctx.lineTo(b[0]-14*Math.cos(ang-.42),b[1]-14*Math.sin(ang-.42));
+    ctx.lineTo(b[0]-14*Math.cos(ang+.42),b[1]-14*Math.sin(ang+.42));ctx.closePath();ctx.fill();
+    ctx.strokeStyle=c;ctx.globalAlpha=.8;ctx.lineWidth=2;ctx.beginPath();ctx.arc(b[0],b[1],7+3*Math.sin(now/240),0,7);ctx.stroke();ctx.globalAlpha=1;
   }
   for(const[name,r]of Object.entries(S.robots)){
     const c=cols[name]||'#c66bff';

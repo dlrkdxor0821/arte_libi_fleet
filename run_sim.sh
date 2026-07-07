@@ -59,10 +59,13 @@ tmux new-window -t "$SESSION" -n console
 tmux send-keys -t "$SESSION:console" \
   "$SRC; sleep 4; cd $REPO/service/aba_service; ( sleep 5 && xdg-open http://localhost:8001 >/dev/null 2>&1 ) & LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001" C-m
 
-# ④ rviz (map + navgraph + 로봇 3대 마커, fixed=map)
-tmux new-window -t "$SESSION" -n rviz
-tmux send-keys -t "$SESSION:rviz" \
-  "$SRC; sleep 8; ros2 launch $REPO/scripts/sim/view.launch.py map:=$REPO/libi_fleet/maps/library/new_map.yaml navgraph:=$NAVGRAPH" C-m
+# ④ rviz (선택) — slotcar 알고리즘 테스트엔 불필요(costmap/라이다용). GPU 경합으로 콘솔 렉 유발.
+#    필요하면 RVIZ=1 ./run_sim.sh 로만 띄운다.
+if [ "${RVIZ:-0}" = "1" ]; then
+  tmux new-window -t "$SESSION" -n rviz
+  tmux send-keys -t "$SESSION:rviz" \
+    "$SRC; sleep 8; ros2 launch $REPO/scripts/sim/view.launch.py map:=$REPO/libi_fleet/maps/library/new_map.yaml navgraph:=$NAVGRAPH" C-m
+fi
 
 cat <<EOF
 
@@ -70,7 +73,7 @@ cat <<EOF
    gazebo  : Gazebo GUI + slotcar 3대
    fleet   : FMS (배차/교통 pluginlib)
    console : 관제 화면 → http://localhost:8001
-   rviz    : map + navgraph 마커
+   (rviz   : 기본 꺼짐 — 필요시 RVIZ=1 ./run_sim.sh)
   전환 Ctrl-b n/p · detach Ctrl-b d · 종료 ./run_sim.sh down
 
 EOF
