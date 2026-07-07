@@ -3,7 +3,8 @@ string pickup
 string dropoff      # goal vertex index
 string requester
 string robot        # optional: 강제 배정할 로봇(비우면 dispatcher)
-int32 priority      # 높을수록 우선. 교착 시 낮은 쪽이 양보/우회. 기본 0.
+int32 priority      # (참고용) task 지정 우선도. 기본 0.
+int32 arm_actions   # 이 작업의 로봇팔 동작 횟수. 배터리 완주 가능성 추정에 사용. 기본 0.
 ---
 bool accepted
 string task_id

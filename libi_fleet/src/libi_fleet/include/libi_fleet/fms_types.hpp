@@ -10,6 +10,7 @@ struct RobotInfo
   std::string name;
   double x{0.0};
   double y{0.0};
+  double battery{100.0};   // 배터리 잔량(%). /robot_state 의 battery_percent 로 갱신(관측 전 100).
   bool busy{false};
   std::string task_id;
 };

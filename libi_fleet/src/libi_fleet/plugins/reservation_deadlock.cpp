@@ -1,8 +1,10 @@
-// 교통관제 = 노드 예약 + 엣지 예약(정면충돌 방지) + wait-for 그래프 DFS 교착 감지.
-//   · 로봇은 자기가 서 있는 노드를 점유하고, 인접 노드로 이동 요청.
-//   · GRANT 시 목표 노드 + 진행 방향 엣지를 예약(출발 노드는 도착할 때 release).
-//   · 목표가 점유중이거나 반대방향 엣지가 잡혀 있으면(head-on) 대기.
+// 교통관제 = 노드 예약 + wait-for 그래프 DFS 교착 감지.
+//   · 로봇은 자기가 서 있는 노드를 점유(claim)하고, 인접 노드로 이동 요청.
+//   · GRANT 시 목표 노드를 예약(출발 노드는 출발 순간 release).
+//   · 목표 노드가 점유중이면 대기.
 //   · 대기가 사이클을 이루면(A→B, B→A …) DFS 로 감지 → DEADLOCK 반환(호출측이 우회).
+//   ※ "타깃 노드를 먼저 확보한 뒤 출발 노드를 놓는" 규율이라, 노드예약만으로
+//      정면충돌(head-on)·후미추돌이 전부 막힌다 → 엣지예약은 두지 않는다.
 #include <map>
 #include <set>
 #include <string>
@@ -34,13 +36,11 @@ public:
       return MoveDecision::WAIT;
     }
 
-    // 경합 상대 찾기: (1) 목표 노드 점유자, (2) 반대방향 엣지 점유자(정면충돌).
+    // 경합 상대 찾기: 목표 노드 점유자.
     std::string blocker = owner_of_node(to, robot);
-    if (blocker.empty()) { blocker = owner_of_edge(to, from, robot); }
 
     if (blocker.empty()) {
       node_owner_[to] = robot;              // 목표 노드 예약
-      edge_owner_[{from, to}] = robot;      // 진행 엣지 예약
       waitfor_.erase(robot);
       return MoveDecision::GRANT;
     }
@@ -64,10 +64,6 @@ public:
   {
     auto it = node_owner_.find(node);
     if (it != node_owner_.end() && it->second == robot) { node_owner_.erase(it); }
-    for (auto e = edge_owner_.begin(); e != edge_owner_.end();) {   // 이 노드발 엣지 예약 해제
-      if (e->second == robot && e->first.first == node) { e = edge_owner_.erase(e); }
-      else { ++e; }
-    }
     waitfor_.erase(robot);
   }
 
@@ -76,12 +72,6 @@ public:
     auto it = node_owner_.find(node);
     if (it != node_owner_.end() && it->second == robot) { node_owner_.erase(it); }
     waitfor_.erase(robot);
-  }
-
-  void release_edge(const std::string & robot, int from, int to) override
-  {
-    auto e = edge_owner_.find({from, to});
-    if (e != edge_owner_.end() && e->second == robot) { edge_owner_.erase(e); }
   }
 
   std::vector<std::pair<int, std::string>> occupancy() const override
@@ -96,11 +86,6 @@ private:
   {
     auto it = node_owner_.find(node);
     return (it != node_owner_.end() && it->second != self) ? it->second : "";
-  }
-  std::string owner_of_edge(int a, int b, const std::string & self) const
-  {
-    auto it = edge_owner_.find({a, b});
-    return (it != edge_owner_.end() && it->second != self) ? it->second : "";
   }
 
   // waitfor_ 는 각 로봇이 정확히 1명을 기다리는 함수형 그래프.
@@ -135,10 +120,9 @@ private:
     return *v;
   }
 
-  std::map<int, std::string> node_owner_;                  // 노드 → 점유 로봇
-  std::map<std::pair<int, int>, std::string> edge_owner_;  // (from,to) → 점유 로봇
-  std::map<std::string, std::string> waitfor_;             // 로봇 → 기다리는 상대
-  std::map<std::string, int> prio_;                        // 로봇 → 현재 task 우선순위
+  std::map<int, std::string> node_owner_;      // 노드 → 점유 로봇
+  std::map<std::string, std::string> waitfor_; // 로봇 → 기다리는 상대
+  std::map<std::string, int> prio_;            // 로봇 → 현재 우선순위
 };
 
 }  // namespace libi_fleet

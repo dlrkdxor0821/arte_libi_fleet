@@ -11,6 +11,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SubmitTask.srv"
   "srv/SetPlugins.srv"
   "srv/SetRobotMode.srv"
+  "srv/SetBattery.srv"
   "action/Navigate.action"
   "action/PerformAction.action"
   DEPENDENCIES geometry_msgs

@@ -28,7 +28,7 @@
     <include file="$(find-pkg-share pinky_description)/launch/upload_robot.launch.py">
         <arg name='use_sim_time' value='True'/>
         <arg name='is_sim' value='True'/>
-        <arg name='drive' value='slotcar'/>
+        <arg name='description_file' value='urdf/pinky_slotcar.urdf.xacro'/>
     </include>
 
     <!-- 스폰 (navgraph 정점 위) -->

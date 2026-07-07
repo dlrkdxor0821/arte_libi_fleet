@@ -11,6 +11,7 @@
 #include <libi_fleet_msgs/srv/submit_task.hpp>
 #include <libi_fleet_msgs/srv/set_plugins.hpp>
 #include <libi_fleet_msgs/srv/set_robot_mode.hpp>
+#include <libi_fleet_msgs/srv/set_battery.hpp>
 #include <libi_fleet_msgs/msg/task_state.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -26,6 +27,7 @@
 using SubmitTask = libi_fleet_msgs::srv::SubmitTask;
 using SetPlugins = libi_fleet_msgs::srv::SetPlugins;
 using SetRobotMode = libi_fleet_msgs::srv::SetRobotMode;
+using SetBattery = libi_fleet_msgs::srv::SetBattery;
 using TaskState = libi_fleet_msgs::msg::TaskState;
 using RmfRobotState = rmf_fleet_msgs::msg::RobotState;
 using PathRequest = rmf_fleet_msgs::msg::PathRequest;
@@ -36,6 +38,13 @@ namespace libi_fleet
 
 constexpr double kArrive = 0.35;   // 도착 판정 거리(m)
 
+// 교통 우선순위 인코딩(단일 int): tier(가장 큼) > task 나이(오래된=큼) > 배터리(낮은=큼).
+//   tier: 순회=0 · 작업=1 · 충전복귀(CHARGE)=2 · 완전막힘(STUCK, 동적)=3
+constexpr int kTierStep = 50000000;      // tier 간 간격 (age 최대치 kSeqMax*kAgeStep 보다 큼)
+constexpr int kAgeStep  = 128;           // task 나이 1스텝 (배터리 최대 100 보다 큼)
+constexpr int kSeqMax   = 100000;        // 나이 정규화 상한(세션 태스크 수 가정)
+constexpr int kStopPrio = 4 * kTierStep; // STOP 장애물(사다리 밖, 항상 최상위)
+
 struct ActiveTask
 {
   std::string id;
@@ -45,7 +54,10 @@ struct ActiveTask
   bool moving{false};
   bool wait_logged{false};
   bool patrol{false};      // 순회 task: 끝에 도달해도 완료 안 하고 루프 반복
-  int priority{0};         // task 우선순위(높을수록 우선). 교착 시 낮은 쪽이 양보.
+  bool stuck{false};       // 완전 막힘(우회 실패) → 우선순위 top 으로 escalate, 풀리면 원복
+  int priority{0};         // (참고용) UI 지정 우선도. 교통 우선순위는 compute_priority 가 계산.
+  int start_seq{0};        // 생성 순서(작을수록 오래됨) — 우선순위 나이 tiebreak
+  int arm_actions{0};      // 팔 동작 횟수(배터리 소비 추정용)
 };
 
 class FleetNode : public rclcpp::Node
@@ -61,6 +73,11 @@ public:
     const std::string traf_name = declare_parameter<std::string>("traffic_plugin", "libi_fleet::ReservationDeadlock");
     const std::string fleet = declare_parameter<std::string>("fleet_name", "libi");
     fleet_name_ = fleet;
+
+    // 배터리 소비 모델(sim 가정값). 완주 가능성 관문: battery% ≥ 소비% + reserve.
+    energy_.drain_per_m   = declare_parameter<double>("battery_drain_per_m", 1.0);   // 주행 1m당 %
+    energy_.drain_per_act = declare_parameter<double>("battery_drain_per_act", 0.5); // 팔 1동작당 %
+    energy_.reserve       = declare_parameter<double>("battery_reserve_pct", 15.0);  // 최소 잔여 %
 
     // 순회(patrol) 모드: 켜지면 idle 로봇이 patrol_route(외곽 루프)를 무한 순회.
     patrol_ = declare_parameter<bool>("patrol", true);
@@ -97,8 +114,11 @@ public:
     mode_srv_ = create_service<SetRobotMode>(
       "/fms/set_robot_mode",
       std::bind(&FleetNode::on_set_mode, this, std::placeholders::_1, std::placeholders::_2));
+    battery_srv_ = create_service<SetBattery>(
+      "/fms/set_battery",
+      std::bind(&FleetNode::on_set_battery, this, std::placeholders::_1, std::placeholders::_2));
 
-    timer_ = create_wall_timer(std::chrono::milliseconds(250),
+    timer_ = create_wall_timer(std::chrono::milliseconds(150),
                                std::bind(&FleetNode::on_timer, this));
     RCLCPP_INFO(get_logger(), "libi_fleet FMS up");
   }
@@ -110,6 +130,8 @@ private:
     r.name = msg->name;
     r.x = msg->location.x;
     r.y = msg->location.y;
+    // 배터리는 sim(slotcar)의 battery_percent 를 신뢰하지 않고 내부 상태로 관리(기본 100%).
+    // 콘솔 UI(/fms/set_battery)로 각 로봇 배터리를 설정 → 완주 관문·우선순위에 반영.
     if (robot_mode_.find(msg->name) == robot_mode_.end()) {
       robot_mode_[msg->name] = patrol_ ? "PATROL" : "IDLE";   // 최초 관측 시 기본 모드
     }
@@ -144,6 +166,7 @@ private:
     if (goal < 0 || goal >= graph_.size()) {
       res->accepted = false; res->reason = "bad_goal_vertex"; return;
     }
+    const int arm_actions = req->arm_actions > 0 ? req->arm_actions : 0;   // 팔 동작 횟수
     std::string robot;
     if (!req->robot.empty()) {              // 특정 로봇 강제 배정
       auto it = robots_.find(req->robot);
@@ -151,12 +174,13 @@ private:
       if (mode_of(req->robot) == "STOP") { res->accepted = false; res->reason = "robot_stopped"; return; }
       if (it->second.busy) { res->accepted = false; res->reason = "robot_busy"; return; }
       robot = req->robot;
-    } else {                                // dispatcher 가 선택 (STOP 로봇 제외)
+    } else {                                // dispatcher 가 선택 (STOP·CHARGE 로봇 제외)
       std::vector<RobotInfo> snapshot;
       for (const auto & kv : robots_) {
-        if (mode_of(kv.first) != "STOP") { snapshot.push_back(kv.second); }
+        const std::string m = mode_of(kv.first);
+        if (m != "STOP" && m != "CHARGE") { snapshot.push_back(kv.second); }
       }
-      robot = dispatcher_->assign(goal, snapshot, graph_);
+      robot = dispatcher_->assign(goal, arm_actions, snapshot, graph_, energy_);
     }
     if (robot.empty()) {
       res->accepted = false; res->reason = "no_robot_available"; return;
@@ -167,12 +191,20 @@ private:
     if (path.size() < 2) {
       res->accepted = false; res->reason = "no_path"; return;
     }
+    // 완주 가능성 관문(강제 배정도 포함 — 방전 좌초 방지). 자동배차는 dispatcher 가 이미 필터.
+    double need = path_cost(path) * energy_.drain_per_m
+                + arm_actions * energy_.drain_per_act + energy_.reserve;
+    if (r.battery < need) {
+      res->accepted = false; res->reason = "insufficient_battery"; return;
+    }
     r.busy = true;
     std::string tid = "T-" + std::to_string(++task_counter_);
     r.task_id = tid;
     ActiveTask t; t.id = tid; t.robot = robot; t.path = path; t.idx = 1; t.moving = false;
     t.priority = req->priority;
-    traffic_->request_move(robot, path[0], path[0], t.priority);   // 시작 노드 점유(claim)
+    t.start_seq = ++task_seq_;
+    t.arm_actions = arm_actions;
+    traffic_->request_move(robot, path[0], path[0], compute_priority(robot, t));   // 시작 노드 점유
     tasks_.push_back(t);
     res->accepted = true; res->task_id = tid; res->reason = "";
     publish_task_state(tid, "ASSIGNED", robot);
@@ -200,7 +232,7 @@ private:
       double d = std::hypot(r.x - tv.x, r.y - tv.y);
 
       if (t.moving && d < kArrive) {
-        traffic_->release_edge(t.robot, t.path[t.idx - 1], t.path[t.idx]);   // 지나온 엣지 해제
+        // 도착: 예약한 목표 노드는 그대로 소유(다음 출발 때 release). 엣지 예약은 없음.
         RCLCPP_INFO(get_logger(), "[%s] %s 도착 v%d", t.id.c_str(), t.robot.c_str(), t.path[t.idx]);
         t.idx++;
         t.moving = false;
@@ -222,23 +254,25 @@ private:
       if (!t.moving) {
         int cur = t.path[t.idx - 1];
         int next = t.path[t.idx];
-        MoveDecision dec = traffic_->request_move(t.robot, cur, next, t.priority);
+        MoveDecision dec = traffic_->request_move(t.robot, cur, next, compute_priority(t.robot, t));
         if (dec == MoveDecision::GRANT) {
-          traffic_->release_node(t.robot, cur);   // 출발 순간 이전 노드 해제(엣지는 유지)
+          traffic_->release_node(t.robot, cur);   // 출발 순간 이전 노드 해제
           send_path(t.robot, r.x, r.y, graph_.vertex(next));
-          t.moving = true; t.wait_logged = false;
+          t.moving = true; t.wait_logged = false; t.stuck = false;   // 풀림 → escalation 해제
           RCLCPP_INFO(get_logger(), "[%s] %s → v%d (GRANT)", t.id.c_str(), t.robot.c_str(), next);
         } else if (dec == MoveDecision::DEADLOCK) {
           auto reroute = graph_.dijkstra(cur, t.path.back(), next);   // next 를 피해 우회
           if (reroute.size() >= 2) {
             RCLCPP_WARN(get_logger(), "[%s] %s ⚠ 교착 감지(v%d) → 우회경로 %zu nodes",
                         t.id.c_str(), t.robot.c_str(), next, reroute.size());
-            t.path = reroute; t.idx = 1; t.moving = false; t.wait_logged = false;
-          } else if (!t.wait_logged) {
-            publish_task_state(t.id, "EXECUTING", t.robot);
-            RCLCPP_ERROR(get_logger(), "[%s] %s ⚠ 교착 감지(v%d), 우회 불가 → 대기",
-                         t.id.c_str(), t.robot.c_str(), next);
-            t.wait_logged = true;
+            t.path = reroute; t.idx = 1; t.moving = false; t.wait_logged = false; t.stuck = false;
+          } else {
+            if (!t.stuck) {   // 우회 불가 = 완전 막힘 → 우선순위 최상위로 escalate(주변이 비켜줌)
+              t.stuck = true;
+              RCLCPP_WARN(get_logger(), "[%s] %s ⛔ 완전 막힘(v%d) 우회 불가 → 우선순위 최상위 상향",
+                          t.id.c_str(), t.robot.c_str(), next);
+            }
+            if (!t.wait_logged) { publish_task_state(t.id, "EXECUTING", t.robot); t.wait_logged = true; }
           }
         } else {   // WAIT
           if (blocked_by_stopped(next)) {   // 정지 로봇(영구 장애물)이 막음 → 우회
@@ -294,6 +328,41 @@ private:
     return false;
   }
 
+  double battery_of(const std::string & robot) const
+  {
+    auto it = robots_.find(robot);
+    return it == robots_.end() ? 100.0 : it->second.battery;
+  }
+
+  // 경로(정점 인덱스)의 실제 주행거리(m).
+  double path_cost(const std::vector<int> & path) const
+  {
+    double c = 0.0;
+    for (size_t i = 1; i < path.size(); ++i) {
+      const Vertex & a = graph_.vertex(path[i - 1]);
+      const Vertex & b = graph_.vertex(path[i]);
+      c += std::hypot(a.x - b.x, a.y - b.y);
+    }
+    return c;
+  }
+
+  // 교통 우선순위(단일 int): tier(가장 큼) > task 나이(오래된=큼) > 배터리(낮은=큼).
+  //   tier: 순회=0 · 작업=1 · 충전복귀(CHARGE)=2 · 완전막힘(STUCK,동적)=3
+  int compute_priority(const std::string & robot, const ActiveTask & t) const
+  {
+    int tier;
+    if (t.stuck) { tier = 3; }                              // 완전 막힘(escalation)
+    else if (mode_of(robot) == "CHARGE") { tier = 2; }      // 충전 복귀
+    else if (t.patrol) { tier = 0; }                        // 순회
+    else { tier = 1; }                                      // 작업
+    int seq = t.start_seq < kSeqMax ? t.start_seq : kSeqMax;
+    int age = kSeqMax - seq;                                // 오래된(작은 seq)일수록 큼
+    int bi = static_cast<int>(std::lround(battery_of(robot)));
+    if (bi < 0) { bi = 0; } else if (bi > 100) { bi = 100; }
+    int batt = 100 - bi;                                    // 낮은 배터리일수록 큼
+    return tier * kTierStep + age * kAgeStep + batt;
+  }
+
   // 로봇의 활성 task 취소: 점유(현재+예약 노드) 해제 후 task 제거, busy 해제.
   void cancel_task(const std::string & robot)
   {
@@ -332,8 +401,9 @@ private:
     std::string tid = "P-" + r.name;
     r.task_id = tid;
     ActiveTask t; t.id = tid; t.robot = r.name; t.path = path;
-    t.idx = 1; t.moving = false; t.patrol = true; t.priority = 0;   // 순회는 최저 우선순위
-    traffic_->request_move(r.name, path[0], path[0], 0);   // 진입점 점유
+    t.idx = 1; t.moving = false; t.patrol = true;   // 순회는 최저 tier
+    t.start_seq = ++task_seq_;
+    traffic_->request_move(r.name, path[0], path[0], compute_priority(r.name, t));   // 진입점 점유
     tasks_.push_back(t);
     publish_task_state(tid, "PATROL", r.name);
     RCLCPP_INFO(get_logger(), "[%s] %s 순회 시작 (진입 v%d, %zu nodes)",
@@ -381,23 +451,40 @@ private:
                    std::shared_ptr<SetRobotMode::Response> res)
   {
     const std::string & m = req->mode;
-    if (m != "PATROL" && m != "IDLE" && m != "STOP") {
+    if (m != "PATROL" && m != "IDLE" && m != "STOP" && m != "CHARGE") {
       res->ok = false; res->reason = "bad_mode"; return;
     }
-    cancel_task(req->robot);          // 모드 전환 시 현재 task 취소(점유 해제)
-    for (const auto & no : traffic_->occupancy()) {   // 남은 점유(이전 정지 claim 등) 해제
-      if (no.second == req->robot) { traffic_->release(req->robot, no.first); }
+    // CHARGE 는 sim 용 상태 태그(실제 복귀 X) — 진행 중 task 를 유지한 채 우선순위만 최상위로.
+    // 그 외 모드 전환은 현재 task 취소(점유 해제).
+    if (m != "CHARGE") {
+      cancel_task(req->robot);
+      for (const auto & no : traffic_->occupancy()) {   // 남은 점유(이전 정지 claim 등) 해제
+        if (no.second == req->robot) { traffic_->release(req->robot, no.first); }
+      }
     }
     robot_mode_[req->robot] = m;      // 미관측 로봇도 저장(관측되면 적용)
     if (m == "STOP") {                // 정지 로봇은 현재 노드를 장애물로 점유(다른 로봇이 우회)
       auto it = robots_.find(req->robot);
       if (it != robots_.end()) {
         int node = graph_.nearest(it->second.x, it->second.y);
-        traffic_->request_move(req->robot, node, node, 1000000);
+        traffic_->request_move(req->robot, node, node, kStopPrio);
       }
     }
     res->ok = true; res->reason = "";
     RCLCPP_INFO(get_logger(), "로봇 모드: %s → %s", req->robot.c_str(), m.c_str());
+  }
+
+  // sim 테스트용 배터리 설정(각 로봇). 완주 관문·우선순위에 즉시 반영.
+  void on_set_battery(const std::shared_ptr<SetBattery::Request> req,
+                      std::shared_ptr<SetBattery::Response> res)
+  {
+    double v = req->value;
+    if (v < 0.0) { v = 0.0; } else if (v > 100.0) { v = 100.0; }
+    auto & r = robots_[req->robot];   // 미관측 로봇도 생성(관측되면 위치 갱신)
+    r.name = req->robot;
+    r.battery = v;
+    res->ok = true; res->reason = "";
+    RCLCPP_INFO(get_logger(), "배터리 설정: %s → %.0f%%", req->robot.c_str(), v);
   }
 
   // plugins
@@ -416,8 +503,10 @@ private:
   std::map<std::string, std::string> robot_mode_;   // 로봇 → PATROL|IDLE|STOP
   std::map<std::string, RobotInfo> robots_;
   std::vector<ActiveTask> tasks_;
+  EnergyParams energy_;             // 배터리 소비 모델(완주 가능성 관문)
   int task_counter_{0};
   int path_seq_{0};
+  int task_seq_{0};                 // 전체 task 생성 순서(우선순위 나이 tiebreak)
 
   rclcpp::Subscription<RmfRobotState>::SharedPtr state_sub_;
   rclcpp::Publisher<PathRequest>::SharedPtr path_pub_;
@@ -427,6 +516,7 @@ private:
   rclcpp::Service<SetPlugins>::SharedPtr plugins_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reload_srv_;
   rclcpp::Service<SetRobotMode>::SharedPtr mode_srv_;
+  rclcpp::Service<SetBattery>::SharedPtr battery_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

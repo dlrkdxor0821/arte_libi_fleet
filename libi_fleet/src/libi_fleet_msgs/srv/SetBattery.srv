@@ -1,0 +1,5 @@
+string robot        # 대상 로봇
+float32 value       # 설정할 배터리 % (0~100). sim 테스트용 배터리 오버라이드.
+---
+bool ok
+string reason

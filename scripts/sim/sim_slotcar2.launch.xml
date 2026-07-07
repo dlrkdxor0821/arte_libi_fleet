@@ -21,7 +21,7 @@
     <include file="$(find-pkg-share pinky_description)/launch/upload_robot.launch.py">
         <arg name='use_sim_time' value='True'/>
         <arg name='is_sim' value='True'/>
-        <arg name='drive' value='slotcar'/>
+        <arg name='description_file' value='urdf/pinky_slotcar.urdf.xacro'/>
     </include>
 
     <!-- pinky1 @ 아일L_상 v0(-6.8,10.2) — 외곽 루프 순회 시작점 -->
