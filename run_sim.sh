@@ -56,10 +56,10 @@ tmux new-window -t "$SESSION" -n fleet
 tmux send-keys -t "$SESSION:fleet" \
   "$SRC; sleep 12; ros2 run libi_fleet fleet_node --ros-args -p navgraph_file:=$NAVGRAPH" C-m
 
-# ③ 관제 콘솔 (FastAPI :8001) + 브라우저 자동 열기
+# ③ 관제 콘솔 (FastAPI :8001) — 브라우저 자동열기 제거(down 때 브라우저 같이 꺼지던 원인). 수동으로 http://localhost:8001 열면 세션과 독립
 tmux new-window -t "$SESSION" -n console
 tmux send-keys -t "$SESSION:console" \
-  "$SRC; sleep 4; cd $REPO/service/aba_service; ( sleep 5 && xdg-open http://localhost:8001 >/dev/null 2>&1 ) & LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001 --reload" C-m
+  "$SRC; sleep 4; cd $REPO/service/aba_service; LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001 --reload" C-m
 
 # ④ rviz (선택) — slotcar 알고리즘 테스트엔 불필요(costmap/라이다용). GPU 경합으로 콘솔 렉 유발.
 #    필요하면 RVIZ=1 ./run_sim.sh 로만 띄운다.
@@ -74,7 +74,7 @@ cat <<EOF
   ── libi 관제 스택 기동 (tmux: $SESSION) ──
    gazebo  : Gazebo GUI + slotcar 3대
    fleet   : FMS (배차/교통 pluginlib)
-   console : 관제 화면 → http://localhost:8001
+   console : 관제 화면 → 브라우저에서 직접 http://localhost:8001 열기 (자동열기 없음 → down 해도 브라우저 유지)
    (rviz   : 기본 꺼짐 — 필요시 RVIZ=1 ./run_sim.sh)
   전환 Ctrl-b n/p · detach Ctrl-b d · 종료 ./run_sim.sh down
 
