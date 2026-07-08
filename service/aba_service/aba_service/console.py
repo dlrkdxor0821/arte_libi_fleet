@@ -50,6 +50,7 @@ class Bridge(Node):
         self.paths = {}       # name -> [[x,y],...]  로봇이 지금 향하는 경로 구간
         self.occupancy = {}   # "node" -> robot  (교통 플러그인 실제 예약)
         self.routes = {}      # robot -> [[x,y],...]  목표까지 남은 경로(FMS 발행)
+        self.goals = {}       # robot -> 최종 목적지 정점 (배차 task만; 순회는 없음)
         self.battery_override = {}   # name -> 표시용 배터리 오버라이드
         self.fleet_mode = {}         # name -> 콘솔이 설정한 fleet 모드(PATROL/IDLE/STOP/CHARGE)
         self.task_log = []
@@ -66,6 +67,7 @@ class Bridge(Node):
         self.create_subscription(PathRequest, "/robot_path_requests", self._on_path, 10)
         self.create_subscription(String, "/fms/occupancy", self._on_occ, 10)
         self.create_subscription(String, "/fms/routes", self._on_routes, 10)
+        self.create_subscription(String, "/fms/goals", self._on_goals, 10)
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
                          durability=DurabilityPolicy.VOLATILE)
         self.path_pub = self.create_publisher(PathRequest, "/robot_path_requests", qos)
@@ -111,6 +113,12 @@ class Bridge(Node):
     def _on_routes(self, m):
         try:
             self.routes = json.loads(m.data)
+        except Exception:
+            pass
+
+    def _on_goals(self, m):
+        try:
+            self.goals = json.loads(m.data)
         except Exception:
             pass
 
@@ -285,7 +293,7 @@ def state():
     robots = {n: {**r, "battery": b.battery_override.get(n, 100),   # 기본 100, UI 설정 시 그 값
                   "fleet_mode": b.fleet_mode.get(n, "")}            # 콘솔이 설정한 fleet 모드
               for n, r in b.robots.items()}
-    return {"robots": robots, "paths": b.paths, "routes": b.routes, "occupancy": b.occupancy,
+    return {"robots": robots, "paths": b.paths, "routes": b.routes, "occupancy": b.occupancy, "goals": b.goals,
             "tasks": b.task_log[-14:][::-1],
             "vertices": b.vertices, "lanes": b.lanes, "active": b.active, "map": b.map_meta}
 
@@ -623,7 +631,7 @@ function draw(){
     const route=trimRoute(pw,rp[0],rp[1]);   // [로봇투영점, 다음노드, ...]
     if(route.length<2)continue;
     const nx=route[1];                        // 다음 노드(한 홉)만 그림
-    const ax=X(rp[0]),ay=Y(rp[1]),bx=X(nx[0]),by=Y(nx[1]);
+    const ax=X(route[0][0]),ay=Y(route[0][1]),bx=X(nx[0]),by=Y(nx[1]);   // 시작점=경로 투영(간선 위)
     ctx.strokeStyle=rc;ctx.globalAlpha=1;ctx.lineWidth=4;
     ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(bx,by);ctx.stroke();
     const ang=Math.atan2(by-ay,bx-ax);        // 다음 노드 방향 화살촉
@@ -633,11 +641,18 @@ function draw(){
   }
   for(const[name,r]of Object.entries(S.robots)){
     const c=cols[name]||'#c66bff';
-    const p=interpRobot(name,now)||[r.x,r.y];   // 버퍼드 엔티티 보간(위 정의)
+    let p=interpRobot(name,now)||[r.x,r.y];   // 버퍼드 엔티티 보간
+    const rpw=(S.routes||{})[name];
+    let ang=null;
+    if(rpw&&rpw.length>=2){const tr=trimRoute(rpw,p[0],p[1]);p=tr[0];   // 간선 위로 투영
+      if(tr.length>=2){const nb=tr[1];ang=Math.atan2(Y(nb[1])-Y(p[1]),X(nb[0])-X(p[0]));}}   // 다음 노드 방향=heading
     const px=X(p[0]),py=Y(p[1]);
-    ctx.fillStyle=c;ctx.beginPath();ctx.arc(px,py,9,0,7);ctx.fill();   // shadowBlur 제거(로봇 dot 매프레임 블러)
-    ctx.fillStyle='#06121e';ctx.font='bold 10px ui-monospace';ctx.fillText(name.replace('pinky','P'),px-6,py+3);
-    ctx.fillStyle=c;ctx.font='11px ui-monospace';ctx.fillText(name,px+12,py-10);
+    if(ang!=null){   // 방향 삼각형(▷): 로봇이 향하는 방향
+      ctx.save();ctx.translate(px,py);ctx.rotate(ang);
+      ctx.fillStyle=c;ctx.beginPath();ctx.moveTo(12,0);ctx.lineTo(-7,-7);ctx.lineTo(-7,7);ctx.closePath();ctx.fill();
+      ctx.restore();
+    }else{ ctx.fillStyle=c;ctx.beginPath();ctx.arc(px,py,7,0,7);ctx.fill(); }   // 정지/유휴 = 원
+    ctx.fillStyle=c;ctx.font='11px ui-monospace';ctx.fillText(name,px+13,py-9);
   }
 }
 function short(s){return (s||'?').split('::').pop();}
@@ -650,6 +665,14 @@ function robotGoal(name){   // 최종 목적지 = 그 로봇 경로의 마지막
   S.vertices.forEach((p,i)=>{const dd=(p[0]-g[0])**2+(p[1]-g[1])**2;if(dd<bd){bd=dd;bi=i;}});
   return bi;
 }
+function robotNextNode(name){   // 다음 목적지 = 로봇이 지금 향하는 다음 노드(경로상 다음 waypoint의 정점 index)
+  const pw=(S.routes||{})[name]; if(!pw||pw.length<2||!S.vertices)return null;
+  const r=S.robots[name]; if(!r)return null;
+  const route=trimRoute(pw,r.x,r.y); if(route.length<2)return null;
+  const nx=route[1]; let bi=-1,bd=Infinity;
+  S.vertices.forEach((p,i)=>{const dd=(p[0]-nx[0])**2+(p[1]-nx[1])**2;if(dd<bd){bd=dd;bi=i;}});
+  return bi;
+}
 function taskState(taskId){   // S.tasks(최신순)에서 이 task의 현재 상태
   if(!taskId||!S.tasks)return '';
   for(const t of S.tasks)if(t.task_id===taskId)return t.state;
@@ -659,14 +682,19 @@ function renderCards(){
   if(!S)return; const cols={pinky1:'#ff5d62',pinky2:'#36d98a',pinky3:'#4ea3ff'};
   const rn=Object.keys(S.robots).sort();
   document.getElementById('robotcards').innerHTML = rn.map(n=>{
-    const r=S.robots[n],c=cols[n]||'#c66bff',b=Math.round(r.battery),bc=battColor(b),mc=modeChip(r.fleet_mode,r.mode);
-    const gi=robotGoal(n),gl=(gi!=null)?('v'+gi):'—',st=taskState(r.task);   // 목적지 정점 · 작업 상태
+    const r=S.robots[n],c=cols[n]||'#c66bff',b=Math.round(r.battery),bc=battColor(b),st=taskState(r.task);
+    const ni=robotNextNode(n), nl=(ni!=null)?('v'+ni):'—';                             // 다음 목적지(노드)
+    const gv=(S.goals&&S.goals[n]!=null)?S.goals[n]:null, gl=(gv!=null)?('v'+gv):'—';  // 최종 목적지 = fleet /fms/goals(배차만; 순회는 없음)
+    const hasRoute=(S.routes&&S.routes[n]&&S.routes[n].length>=2);   // 상태 칩: STOP·CHARGE 우선 → 배차중 → 경로있음=순회 → 없음=대기
+    const mc = r.fleet_mode==='STOP'?['정지','#ff7a7a'] : r.fleet_mode==='CHARGE'?['충전복귀','#c66bff']
+             : gv!=null?['배차','#ffb65c'] : hasRoute?['순회','#4ea3ff'] : ['대기','#6f93ab'];
     return `<div class="rcard" style="border-left-color:${c}">
       <div class="rc-h"><span class="dot" style="background:${c}"></span>${n}<span class="rc-m" style="background:${mc[1]}22;color:${mc[1]}">${mc[0]}</span></div>
       <div class="batt"><i style="width:${b}%;background:${bc}"></i></div>
       <div class="rc-row"><span>배터리</span><b style="color:${bc}">${b}%</b></div>
       <div class="rc-row"><span>작업</span><b>${r.task||'—'}${st?' · '+st:''}</b></div>
-      <div class="rc-row"><span>목적지</span><b style="color:${gi!=null?c:'var(--dim)'}">${gl}</b></div>
+      <div class="rc-row"><span>다음 목적지</span><b style="color:${ni!=null?c:'var(--dim)'}">${nl}</b></div>
+      <div class="rc-row"><span>최종 목적지</span><b style="color:${gv!=null?c:'var(--dim)'}">${gl}</b></div>
       <div class="rc-row"><span>위치</span><b>${r.x.toFixed(1)}, ${r.y.toFixed(1)}</b></div>
     </div>`;}).join('') || '<div style="color:var(--dim);font-size:11px;padding:8px 14px">로봇 대기 중… (sim 미연결)</div>';
 }
@@ -749,7 +777,7 @@ function saveNg(){post('/api/navgraph/save',{});}
 function delVertex(){if(sel<0){log('삭제할 정점을 먼저 클릭해 선택하세요',true);return;}post('/api/vertex/del',{index:sel}).then(()=>{sel=-1;});}
 cv.addEventListener('contextmenu',e=>{if(!edit||!T)return;e.preventDefault();const[cx,cy]=epos(e);const vi=nearV(cx,cy);if(vi>=0){post('/api/vertex/del',{index:vi}).then(()=>{if(sel===vi)sel=-1;else if(sel>vi)sel--;});}});
 addEventListener('resize',draw);
-setInterval(poll,200);poll();
+setInterval(poll,100);poll();   // UI 갱신 10Hz (빠른 갱신)
 (function anim(){draw();requestAnimationFrame(anim);})();   // 경로 흐름 애니메이션
 log('console ready — 대상/목표 선택 후 명령하세요.');
 </script></body></html>"""

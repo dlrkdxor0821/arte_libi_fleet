@@ -59,7 +59,7 @@ tmux send-keys -t "$SESSION:fleet" \
 # ③ 관제 콘솔 (FastAPI :8001) — 브라우저 자동열기 제거(down 때 브라우저 같이 꺼지던 원인). 수동으로 http://localhost:8001 열면 세션과 독립
 tmux new-window -t "$SESSION" -n console
 tmux send-keys -t "$SESSION:console" \
-  "$SRC; sleep 4; cd $REPO/service/aba_service; LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001 --reload" C-m
+  "$SRC; sleep 4; cd $REPO/service/aba_service; LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001" C-m
 
 # ④ rviz (선택) — slotcar 알고리즘 테스트엔 불필요(costmap/라이다용). GPU 경합으로 콘솔 렉 유발.
 #    필요하면 RVIZ=1 ./run_sim.sh 로만 띄운다.

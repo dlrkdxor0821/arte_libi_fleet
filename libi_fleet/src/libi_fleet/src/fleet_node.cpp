@@ -44,6 +44,8 @@ constexpr int kTierStep = 50000000;      // tier 간 간격 (age 최대치 kSeqM
 constexpr int kAgeStep  = 128;           // task 나이 1스텝 (배터리 최대 100 보다 큼)
 constexpr int kSeqMax   = 100000;        // 나이 정규화 상한(세션 태스크 수 가정)
 constexpr int kStopPrio = 4 * kTierStep; // STOP 장애물(사다리 밖, 항상 최상위)
+constexpr int kMaxReroutes = 3;          // 교착 우회 최대 연속 횟수 — 초과 시 우회 포기·escalate(livelock 방지)
+constexpr int kStuckTicks  = 100;        // 이동 지시됐는데 무진행이 이 틱(≈15s@150ms) 넘으면 slotcar stuck으로 보고 task 취소
 
 struct ActiveTask
 {
@@ -58,6 +60,9 @@ struct ActiveTask
   int priority{0};         // (참고용) UI 지정 우선도. 교통 우선순위는 compute_priority 가 계산.
   int start_seq{0};        // 생성 순서(작을수록 오래됨) — 우선순위 나이 tiebreak
   int arm_actions{0};      // 팔 동작 횟수(배터리 소비 추정용)
+  int reroutes{0};         // 연속 우회 횟수(노드 도달 시 리셋). 초과 시 우회 포기·escalate → livelock 방지.
+  double last_x{0}, last_y{0};   // 직전 틱 위치 — 무진행(stuck) 감지용
+  int no_move{0};          // 이동 지시 상태에서 무진행 틱 수
 };
 
 class FleetNode : public rclcpp::Node
@@ -102,6 +107,7 @@ public:
     task_pub_ = create_publisher<TaskState>("/fms/task_states", 10);
     occ_pub_ = create_publisher<std_msgs::msg::String>("/fms/occupancy", 10);
     route_pub_ = create_publisher<std_msgs::msg::String>("/fms/routes", 10);
+    goal_pub_ = create_publisher<std_msgs::msg::String>("/fms/goals", 10);
 
     srv_ = create_service<SubmitTask>(
       "/fms/submit_task",
@@ -173,13 +179,16 @@ private:
       auto it = robots_.find(req->robot);
       if (it == robots_.end()) { res->accepted = false; res->reason = "unknown_robot"; return; }
       if (mode_of(req->robot) == "STOP") { res->accepted = false; res->reason = "robot_stopped"; return; }
-      if (it->second.busy) { res->accepted = false; res->reason = "robot_busy"; return; }
+      // 순회/기존 task 중이어도 받는다 — 아래 path/battery 통과 후 기존 task 취소하고 강제 배정.
       robot = req->robot;
     } else {                                // dispatcher 가 선택 (STOP·CHARGE 로봇 제외)
       std::vector<RobotInfo> snapshot;
       for (const auto & kv : robots_) {
         const std::string m = mode_of(kv.first);
-        if (m != "STOP" && m != "CHARGE") { snapshot.push_back(kv.second); }
+        if (m == "STOP" || m == "CHARGE") { continue; }
+        RobotInfo ri = kv.second;
+        if (is_on_patrol(kv.first)) { ri.busy = false; }   // 순회는 중단 가능 → 경매 후보에 포함
+        snapshot.push_back(ri);
       }
       robot = dispatcher_->assign(goal, arm_actions, snapshot, graph_, energy_);
     }
@@ -189,8 +198,9 @@ private:
     auto & r = robots_[robot];
     int start = graph_.nearest(r.x, r.y);
     auto path = graph_.dijkstra(start, goal);
+    if (start == goal) { path = {goal, goal}; }   // 최근접 정점이 곧 목표 → 그 노드로 이동 후 완료(auction.cpp 와 일치, no_path 오거절 방지)
     if (path.size() < 2) {
-      res->accepted = false; res->reason = "no_path"; return;
+      res->accepted = false; res->reason = "no_path"; return;   // 진짜 도달 불가만 거절
     }
     // 완주 가능성 관문(강제 배정도 포함 — 방전 좌초 방지). 자동배차는 dispatcher 가 이미 필터.
     double need = path_cost(path) * energy_.drain_per_m
@@ -198,6 +208,7 @@ private:
     if (r.battery < need) {
       res->accepted = false; res->reason = "insufficient_battery"; return;
     }
+    if (r.busy) { cancel_task(robot); }   // 순회/기존 task 취소하고 이 배차로 대체 (특정 배차·경매 낙찰 공통)
     r.busy = true;
     std::string tid = "T-" + std::to_string(++task_counter_);
     r.task_id = tid;
@@ -232,11 +243,27 @@ private:
       const Vertex & tv = graph_.vertex(t.path[t.idx]);
       double d = std::hypot(r.x - tv.x, r.y - tv.y);
 
+      // ── stuck 감지: 이동 지시(t.moving)됐는데 위치가 안 변하면(슬롯카 벽 끼임 등) →
+      //    예약 노드 해제하고 task 취소. wedged 로봇이 노드를 붙잡아 다른 로봇을 막는 걸 방지. ──
+      if (t.moving && std::hypot(r.x - t.last_x, r.y - t.last_y) < 0.02) { t.no_move++; }
+      else { t.no_move = 0; }
+      t.last_x = r.x; t.last_y = r.y;
+      if (t.no_move > kStuckTicks) {
+        RCLCPP_ERROR(get_logger(), "[%s] %s ⚠ 무진행(슬롯카 stuck 추정) → 예약 해제·task 취소",
+                     t.id.c_str(), t.robot.c_str());
+        if (t.idx < t.path.size()) { traffic_->release_node(t.robot, t.path[t.idx]); }
+        if (t.idx >= 1) { traffic_->release_node(t.robot, t.path[t.idx - 1]); }
+        r.busy = false; r.task_id.clear();
+        publish_task_state(t.id, "FAILED", t.robot);
+        it = tasks_.erase(it); continue;
+      }
+
       if (t.moving && d < kArrive) {
         // 도착: 예약한 목표 노드는 그대로 소유(다음 출발 때 release). 엣지 예약은 없음.
         RCLCPP_INFO(get_logger(), "[%s] %s 도착 v%d", t.id.c_str(), t.robot.c_str(), t.path[t.idx]);
         t.idx++;
         t.moving = false;
+        t.reroutes = 0;   // 노드 도달 = 진전 → 우회 카운터 리셋
         if (t.idx >= t.path.size()) {
           if (t.patrol) {
             t.idx = 1;   // 루프 계속 (path.back()==path[0] 소유 상태 → 아래 이동블록으로)
@@ -257,20 +284,23 @@ private:
         int next = t.path[t.idx];
         MoveDecision dec = traffic_->request_move(t.robot, cur, next, compute_priority(t.robot, t));
         if (dec == MoveDecision::GRANT) {
-          traffic_->release_node(t.robot, cur);   // 출발 순간 이전 노드 해제
+          if (cur != next) { traffic_->release_node(t.robot, cur); }   // 출발 순간 이전 노드 해제 (cur==next=start==goal 케이스는 목표 유지)
           send_path(t.robot, r.x, r.y, graph_.vertex(next));
           t.moving = true; t.wait_logged = false; t.stuck = false;   // 풀림 → escalation 해제
           RCLCPP_INFO(get_logger(), "[%s] %s → v%d (GRANT)", t.id.c_str(), t.robot.c_str(), next);
         } else if (dec == MoveDecision::DEADLOCK) {
-          auto reroute = graph_.dijkstra(cur, t.path.back(), next);   // next 를 피해 우회
+          // 우회는 kMaxReroutes 번까지만(livelock 방지). 초과하면 우회 포기 → escalate + 대기.
+          auto reroute = (t.reroutes < kMaxReroutes)
+                       ? graph_.dijkstra(cur, t.path.back(), next) : std::vector<int>{};   // next 를 피해 우회
           if (reroute.size() >= 2) {
-            RCLCPP_WARN(get_logger(), "[%s] %s ⚠ 교착 감지(v%d) → 우회경로 %zu nodes",
-                        t.id.c_str(), t.robot.c_str(), next, reroute.size());
+            t.reroutes++;
+            RCLCPP_WARN(get_logger(), "[%s] %s ⚠ 교착 감지(v%d) → 우회 %zu nodes (재시도 %d/%d)",
+                        t.id.c_str(), t.robot.c_str(), next, reroute.size(), t.reroutes, kMaxReroutes);
             t.path = reroute; t.idx = 1; t.moving = false; t.wait_logged = false; t.stuck = false;
           } else {
-            if (!t.stuck) {   // 우회 불가 = 완전 막힘 → 우선순위 최상위로 escalate(주변이 비켜줌)
+            if (!t.stuck) {   // 우회 불가 or 우회 반복초과(livelock) → 우선순위 최상위 escalate(주변이 비켜줌) 후 대기
               t.stuck = true;
-              RCLCPP_WARN(get_logger(), "[%s] %s ⛔ 완전 막힘(v%d) 우회 불가 → 우선순위 최상위 상향",
+              RCLCPP_WARN(get_logger(), "[%s] %s ⛔ 완전막힘/우회반복(v%d) → 우선순위 최상위 상향, 대기",
                           t.id.c_str(), t.robot.c_str(), next);
             }
             if (!t.wait_logged) { publish_task_state(t.id, "EXECUTING", t.robot); t.wait_logged = true; }
@@ -298,6 +328,7 @@ private:
     }
     publish_occupancy();
     publish_routes();
+    publish_goals();
   }
 
   // 각 로봇의 남은 경로(현재 노드→목표)를 JSON 으로 발행(시각화용): {"robot":[[x,y],...]}.
@@ -320,6 +351,22 @@ private:
     j += "}";
     std_msgs::msg::String m; m.data = j;
     route_pub_->publish(m);
+  }
+
+  // 각 로봇의 최종 목적지 발행(배차 task만; 순회는 제외 → 콘솔에서 "—"). {"robot": goalVertex}.
+  void publish_goals()
+  {
+    std::string j = "{";
+    bool first = true;
+    for (const auto & t : tasks_) {
+      if (t.patrol) { continue; }              // 순회는 최종 목적지 없음
+      if (!first) { j += ","; }
+      j += "\"" + t.robot + "\":" + std::to_string(t.path.back());
+      first = false;
+    }
+    j += "}";
+    std_msgs::msg::String m; m.data = j;
+    goal_pub_->publish(m);
   }
 
   // 교통 플러그인의 실제 예약(노드→로봇)을 JSON 으로 발행(시각화용).
@@ -385,6 +432,13 @@ private:
     if (bi < 0) { bi = 0; } else if (bi > 100) { bi = 100; }
     int batt = 100 - bi;                                    // 낮은 배터리일수록 큼
     return tier * kTierStep + age * kAgeStep + batt;
+  }
+
+  // 이 로봇의 활성 task 가 순회(patrol)인가 — 순회는 배차로 중단 가능.
+  bool is_on_patrol(const std::string & robot) const
+  {
+    for (const auto & t : tasks_) { if (t.robot == robot) { return t.patrol; } }
+    return false;
   }
 
   // 로봇의 활성 task 취소: 점유(현재+예약 노드) 해제 후 task 제거, busy 해제.
@@ -537,6 +591,7 @@ private:
   rclcpp::Publisher<TaskState>::SharedPtr task_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr occ_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr route_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr goal_pub_;
   rclcpp::Service<SubmitTask>::SharedPtr srv_;
   rclcpp::Service<SetPlugins>::SharedPtr plugins_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reload_srv_;
