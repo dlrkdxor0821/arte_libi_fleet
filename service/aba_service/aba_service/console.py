@@ -259,6 +259,14 @@ def _startup():
     threading.Thread(target=lambda: rclpy.spin(_bridge), daemon=True).start()
 
 
+@app.on_event("shutdown")
+def _shutdown():
+    try:
+        rclpy.shutdown()   # --reload/종료 시 rclpy 정리 → 재시작 크래시 방지
+    except Exception:
+        pass
+
+
 class TaskReq(BaseModel):
     goal: int
     priority: int = 0
@@ -450,7 +458,7 @@ td{padding:4px;border-bottom:1px solid #0d2438}
     <div class="ey">로봇 상태</div>
     <div id="robotcards"></div>
   </aside>
-  <div class="map"><span class="maptag">NAVGRAPH · L1 · world coords (m)</span><canvas id="cv"></canvas></div>
+  <div class="map"><span class="maptag">NAVGRAPH · L1 · world coords (m)</span><span id="meas" style="position:absolute;left:14px;bottom:12px;z-index:5;font-family:var(--mono);font-size:11px;letter-spacing:.03em;color:var(--amber);background:rgba(3,10,18,.55);padding:3px 8px;border:1px solid var(--edge);border-radius:2px">계측 대기… (로봇을 움직여 보세요)</span><canvas id="cv"></canvas></div>
   <aside class="panel">
     <div class="grp">
       <div class="ey">① 특정 로봇 배차</div>
@@ -521,14 +529,59 @@ td{padding:4px;border-bottom:1px solid #0d2438}
 </div>
 <script>
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
-let S=null, disp={}, T=null, mapImg=null, edit=false, sel=-1, drag=-1, moved=false, downEmpty=null;
+let S=null, T=null, mapImg=null, edit=false, sel=-1, drag=-1, moved=false, downEmpty=null;
 function log(m,err){const l=document.getElementById('log');
   l.insertAdjacentHTML('afterbegin',`<span class="t">${new Date().toLocaleTimeString()}</span>  <span class="${err?'e':''}">${m}</span>\n`);}
 function bounds(v){const xs=v.map(p=>p[0]),ys=v.map(p=>p[1]);return[Math.min(...xs)-1.2,Math.max(...xs)+1.2,Math.min(...ys)-1.2,Math.max(...ys)+1.2];}
+// ── 로봇 위치 = 버퍼드 엔티티 보간 (게임 넷코드 표준, Gambetta) ──
+//   poll이 좌표 스냅샷을 시간과 함께 쌓고(ingestRobots), draw는 "지금-지연" 시점을
+//   두 실제 스냅샷 사이 선형보간으로 그린다 → 발행율이 낮거나 불규칙해도 등속·매끈.
+//   지연은 평균 스냅샷 간격에 맞춰 자동조정(발행이 빨라지면 지연도 줄어 실시간에 근접).
+const RBUF={};        // name -> [{t,x,y}...] 시간순 스냅샷
+let _riAvg=400;       // 스냅샷 평균 간격(ms) EMA
+function ingestRobots(t){
+  if(!S||!S.robots)return;
+  for(const[name,r]of Object.entries(S.robots)){
+    const b=RBUF[name]||(RBUF[name]=[]), last=b[b.length-1];
+    if(last&&last.x===r.x&&last.y===r.y)continue;          // 좌표 그대로면 skip
+    if(last){const gap=t-last.t; if(gap>40&&gap<6000)_riAvg=_riAvg*0.7+gap*0.3;}
+    b.push({t,x:r.x,y:r.y});
+    if(b.length>12)b.shift();
+  }
+}
+function interpRobot(name,now){
+  const b=RBUF[name]; if(!b||!b.length)return null;
+  const rt=now-Math.min(1000,Math.max(160,_riAvg*1.1));    // 렌더시점 = 지금 - 보간지연
+  if(b.length===1||rt<=b[0].t)return [b[0].x,b[0].y];
+  const nb=b[b.length-1]; if(rt>=nb.t)return [nb.x,nb.y];  // 버퍼 부족 → 최신 유지
+  for(let i=b.length-1;i>0;i--){
+    const a=b[i-1],c=b[i];
+    if(a.t<=rt&&rt<=c.t){
+      if(Math.hypot(c.x-a.x,c.y-a.y)>1.5)return [c.x,c.y]; // 순간이동 스냅
+      const f=(rt-a.t)/((c.t-a.t)||1);
+      return [a.x+(c.x-a.x)*f, a.y+(c.y-a.y)*f];
+    }
+  }
+  return [nb.x,nb.y];
+}
+function trimRoute(pw,rx,ry){   // 로봇 위치를 경로에 투영 → 지나온 앞부분 잘라 [투영점, 남은 waypoint...] 반환
+  let bi=0,bx=pw[0][0],by=pw[0][1],bd=Infinity;
+  for(let i=0;i<pw.length-1;i++){
+    const ax=pw[i][0],ay=pw[i][1],dx=pw[i+1][0]-ax,dy=pw[i+1][1]-ay,L2=dx*dx+dy*dy||1e-9;
+    let t=((rx-ax)*dx+(ry-ay)*dy)/L2; t=t<0?0:t>1?1:t;
+    const px=ax+dx*t,py=ay+dy*t,d=(rx-px)**2+(ry-py)**2;
+    if(d<bd){bd=d;bi=i;bx=px;by=py;}
+  }
+  const rest=[[bx,by]];
+  for(let i=bi+1;i<pw.length;i++)rest.push(pw[i]);
+  return rest;
+}
 function draw(){
   if(!S||!S.vertices.length)return;
   const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
-  cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
+  const bw=Math.round(W*dpr),bh=Math.round(H*dpr);   // 백버퍼는 크기 바뀔 때만 재할당(매프레임 재할당=렉 주범)
+  if(cv.width!==bw||cv.height!==bh){cv.width=bw;cv.height=bh;}
+  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
   const v=S.vertices,[xmin,xmax,ymin,ymax]=bounds(v);
   const s=Math.min(W/(xmax-xmin),H/(ymax-ymin))*0.92;
   const ox=(W-(xmax-xmin)*s)/2, oy=(H-(ymax-ymin)*s)/2;
@@ -540,7 +593,7 @@ function draw(){
   ctx.strokeStyle='rgba(40,90,130,.14)';ctx.lineWidth=1;
   for(let gx=Math.ceil(xmin);gx<xmax;gx++){ctx.beginPath();ctx.moveTo(X(gx),0);ctx.lineTo(X(gx),H);ctx.stroke();}
   for(let gy=Math.ceil(ymin);gy<ymax;gy++){ctx.beginPath();ctx.moveTo(0,Y(gy));ctx.lineTo(W,Y(gy));ctx.stroke();}
-  ctx.strokeStyle='rgba(240,246,252,.92)';ctx.lineWidth=2.6;ctx.shadowColor='rgba(255,255,255,.5)';ctx.shadowBlur=6;
+  ctx.strokeStyle='rgba(235,245,252,.9)';ctx.lineWidth=2.2;   // 간선(노드↔노드)=흰색 (그 위에 로봇색 경로 강조)
   S.lanes.forEach(([a,b])=>{ctx.beginPath();ctx.moveTo(X(v[a][0]),Y(v[a][1]));ctx.lineTo(X(v[b][0]),Y(v[b][1]));ctx.stroke();});
   ctx.shadowBlur=0;
   const now=performance.now();
@@ -549,7 +602,7 @@ function draw(){
     const owner=occ[i], oc=owner?(rcols[owner]||'#c66bff'):null;
     if(oc){   // 점유 노드: 로봇 색으로 크게 채움 + 이중 글로우 링 (실제 예약 상태)
       const pr=13+2*Math.sin(now/300);
-      ctx.shadowColor=oc;ctx.shadowBlur=26;ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),14,0,7);ctx.fillStyle=oc;ctx.fill();ctx.shadowBlur=0;
+      ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),14,0,7);ctx.fillStyle=oc;ctx.fill();   // shadowBlur 제거
       ctx.lineWidth=3;ctx.strokeStyle=oc;ctx.globalAlpha=.85;ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),20,0,7);ctx.stroke();
       ctx.globalAlpha=.4;ctx.lineWidth=2;ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),20+pr,0,7);ctx.stroke();ctx.globalAlpha=1;
       ctx.fillStyle='#06121e';ctx.font='bold 11px ui-monospace';ctx.fillText(owner.replace('pinky','P'),X(p[0])-7,Y(p[1])+4);
@@ -560,30 +613,29 @@ function draw(){
     ctx.fillStyle=oc?'#eaf6ff':'#6f93ab';ctx.font='11px ui-monospace';ctx.fillText('v'+i,X(p[0])+(oc?22:10),Y(p[1])-(oc?12:7));});
   if(edit&&sel>=0&&v[sel]){ctx.strokeStyle='#ffb65c';ctx.lineWidth=2.4;ctx.beginPath();ctx.arc(X(v[sel][0]),Y(v[sel][1]),12,0,7);ctx.stroke();}
   const cols={pinky1:'#ff5d62',pinky2:'#36d98a',pinky3:'#4ea3ff'};
-  // ── 로봇이 갈 경로(목표 노드까지 남은 route): 은은한 바탕선 + 흐르는 점선 + 화살촉 + 목표 펄스 ──
-  //    shadowBlur 미사용(캔버스 렉의 주범) → 60fps 에서 가벼움.
+  // ── 경로: 로봇 → "다음 노드"까지만 (점유 예약 규율상 한 노드씩 전진). 로봇색 굵은 실선 + 화살촉 ──
   ctx.lineCap='round';ctx.lineJoin='round';
   for(const[name,pw]of Object.entries(S.routes||{})){
     if(!pw||pw.length<2)continue;
-    const c=cols[name]||'#c66bff', pts=pw.map(q=>[X(q[0]),Y(q[1])]);
-    ctx.strokeStyle=c;ctx.globalAlpha=.20;ctx.lineWidth=8;
-    ctx.beginPath();pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.stroke();
-    ctx.globalAlpha=.95;ctx.lineWidth=3;ctx.setLineDash([12,9]);ctx.lineDashOffset=-(now/45)%21;
-    ctx.beginPath();pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.stroke();
-    ctx.setLineDash([]);ctx.globalAlpha=1;
-    const a=pts[pts.length-2],b=pts[pts.length-1],ang=Math.atan2(b[1]-a[1],b[0]-a[0]);
-    ctx.fillStyle=c;ctx.beginPath();ctx.moveTo(b[0],b[1]);
-    ctx.lineTo(b[0]-14*Math.cos(ang-.42),b[1]-14*Math.sin(ang-.42));
-    ctx.lineTo(b[0]-14*Math.cos(ang+.42),b[1]-14*Math.sin(ang+.42));ctx.closePath();ctx.fill();
-    ctx.strokeStyle=c;ctx.globalAlpha=.8;ctx.lineWidth=2;ctx.beginPath();ctx.arc(b[0],b[1],7+3*Math.sin(now/240),0,7);ctx.stroke();ctx.globalAlpha=1;
+    const rc=cols[name]||'#c66bff';   // 경로 = 그 로봇 색 (pinky1 빨 / pinky2 초 / pinky3 파)
+    const rp=interpRobot(name,now)||(S.robots[name]?[S.robots[name].x,S.robots[name].y]:null);
+    if(!rp)continue;
+    const route=trimRoute(pw,rp[0],rp[1]);   // [로봇투영점, 다음노드, ...]
+    if(route.length<2)continue;
+    const nx=route[1];                        // 다음 노드(한 홉)만 그림
+    const ax=X(rp[0]),ay=Y(rp[1]),bx=X(nx[0]),by=Y(nx[1]);
+    ctx.strokeStyle=rc;ctx.globalAlpha=1;ctx.lineWidth=4;
+    ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(bx,by);ctx.stroke();
+    const ang=Math.atan2(by-ay,bx-ax);        // 다음 노드 방향 화살촉
+    ctx.fillStyle=rc;ctx.beginPath();ctx.moveTo(bx,by);
+    ctx.lineTo(bx-15*Math.cos(ang-.42),by-15*Math.sin(ang-.42));
+    ctx.lineTo(bx-15*Math.cos(ang+.42),by-15*Math.sin(ang+.42));ctx.closePath();ctx.fill();
   }
   for(const[name,r]of Object.entries(S.robots)){
     const c=cols[name]||'#c66bff';
-    // 실시간 부드럽게: 표시 위치를 실제 위치로 매 프레임 보간(잔상 없음). 순간이동(>1.5m)은 스냅.
-    const d=disp[name]=disp[name]||[r.x,r.y];
-    if(Math.hypot(r.x-d[0],r.y-d[1])>1.5){d[0]=r.x;d[1]=r.y;}else{d[0]+=(r.x-d[0])*0.25;d[1]+=(r.y-d[1])*0.25;}
-    const px=X(d[0]),py=Y(d[1]);
-    ctx.shadowColor=c;ctx.shadowBlur=14;ctx.fillStyle=c;ctx.beginPath();ctx.arc(px,py,9,0,7);ctx.fill();ctx.shadowBlur=0;
+    const p=interpRobot(name,now)||[r.x,r.y];   // 버퍼드 엔티티 보간(위 정의)
+    const px=X(p[0]),py=Y(p[1]);
+    ctx.fillStyle=c;ctx.beginPath();ctx.arc(px,py,9,0,7);ctx.fill();   // shadowBlur 제거(로봇 dot 매프레임 블러)
     ctx.fillStyle='#06121e';ctx.font='bold 10px ui-monospace';ctx.fillText(name.replace('pinky','P'),px-6,py+3);
     ctx.fillStyle=c;ctx.font='11px ui-monospace';ctx.fillText(name,px+12,py-10);
   }
@@ -592,23 +644,51 @@ function short(s){return (s||'?').split('::').pop();}
 function battColor(b){return b>50?'#37d98a':(b>=15?'#ffb65c':'#ff7a7a');}
 function modeChip(fm,rm){const M={PATROL:['순회','#4ea3ff'],IDLE:['대기','#6f93ab'],STOP:['정지','#ff7a7a'],CHARGE:['충전복귀','#c66bff']};
   return (fm&&M[fm])?M[fm]:[rm||'—','#ffb65c'];}
+function robotGoal(name){   // 최종 목적지 = 그 로봇 경로의 마지막 waypoint에 가장 가까운 정점 index
+  const pw=(S.routes||{})[name]; if(!pw||!pw.length||!S.vertices)return null;
+  const g=pw[pw.length-1]; let bi=-1,bd=Infinity;
+  S.vertices.forEach((p,i)=>{const dd=(p[0]-g[0])**2+(p[1]-g[1])**2;if(dd<bd){bd=dd;bi=i;}});
+  return bi;
+}
+function taskState(taskId){   // S.tasks(최신순)에서 이 task의 현재 상태
+  if(!taskId||!S.tasks)return '';
+  for(const t of S.tasks)if(t.task_id===taskId)return t.state;
+  return '';
+}
 function renderCards(){
   if(!S)return; const cols={pinky1:'#ff5d62',pinky2:'#36d98a',pinky3:'#4ea3ff'};
   const rn=Object.keys(S.robots).sort();
   document.getElementById('robotcards').innerHTML = rn.map(n=>{
     const r=S.robots[n],c=cols[n]||'#c66bff',b=Math.round(r.battery),bc=battColor(b),mc=modeChip(r.fleet_mode,r.mode);
+    const gi=robotGoal(n),gl=(gi!=null)?('v'+gi):'—',st=taskState(r.task);   // 목적지 정점 · 작업 상태
     return `<div class="rcard" style="border-left-color:${c}">
       <div class="rc-h"><span class="dot" style="background:${c}"></span>${n}<span class="rc-m" style="background:${mc[1]}22;color:${mc[1]}">${mc[0]}</span></div>
       <div class="batt"><i style="width:${b}%;background:${bc}"></i></div>
       <div class="rc-row"><span>배터리</span><b style="color:${bc}">${b}%</b></div>
-      <div class="rc-row"><span>task</span><b>${r.task||'—'}</b></div>
+      <div class="rc-row"><span>작업</span><b>${r.task||'—'}${st?' · '+st:''}</b></div>
+      <div class="rc-row"><span>목적지</span><b style="color:${gi!=null?c:'var(--dim)'}">${gl}</b></div>
       <div class="rc-row"><span>위치</span><b>${r.x.toFixed(1)}, ${r.y.toFixed(1)}</b></div>
     </div>`;}).join('') || '<div style="color:var(--dim);font-size:11px;padding:8px 14px">로봇 대기 중… (sim 미연결)</div>';
 }
 function fillSel(id,items,fmt){const el=document.getElementById(id);const cur=el.value;
   if(el.options.length!==items.length){el.innerHTML='';items.forEach((it,i)=>el.add(new Option(fmt(it,i),fmt(it,i,true))));if(cur)el.value=cur;}}
+// ── [임시 계측] 로봇 dot 실효 갱신율 HUD — 확인 후 이 블록 + #meas span + measTick() 호출 제거 ──
+let _mChTimes=[],_mPollTimes=[],_mLast=null,_mJump=0,_mPrev=performance.now(),_mDt=0;
+function measTick(){
+  const t=performance.now();_mDt=t-_mPrev;_mPrev=t;_mPollTimes.push(t);
+  const name=S&&S.robots&&Object.keys(S.robots)[0];
+  if(name){const r=S.robots[name],k=r.x+','+r.y;
+    if(_mLast!==null&&k!==_mLast){_mChTimes.push(t);const p=_mLast.split(',').map(Number);_mJump=Math.max(_mJump,Math.hypot(r.x-p[0],r.y-p[1]));}
+    _mLast=k;}
+  const cut=t-3000;
+  while(_mChTimes.length&&_mChTimes[0]<cut)_mChTimes.shift();
+  while(_mPollTimes.length&&_mPollTimes[0]<cut)_mPollTimes.shift();
+  const el=document.getElementById('meas');if(!el)return;
+  el.textContent=`계측(최근3s) ▸ 좌표변화 ${(_mChTimes.length/3).toFixed(1)}Hz · poll ${(_mPollTimes.length/3).toFixed(1)}Hz(${Math.round(_mDt)}ms) · 최대점프 ${_mJump.toFixed(2)}m`;
+}
 async function poll(){
   try{S=await (await fetch('/api/state')).json();
+    ingestRobots(performance.now());   // 로봇 좌표 스냅샷 적재(보간용)
     const rn=Object.keys(S.robots);
     document.getElementById('c_n').textContent=rn.length;
     document.getElementById('c_m').textContent=rn.filter(n=>S.robots[n].mode==='MOVING').length;
@@ -626,7 +706,8 @@ async function poll(){
     // task feed
     document.getElementById('feed').innerHTML=S.tasks.map(t=>`<div><span class="s st-${t.state}">${t.state}</span> ${t.task_id} · ${t.robot}</div>`).join('')||'<div style="color:var(--dim)">대기 중…</div>';
     renderCards();
-    draw();
+    measTick();   // [임시 계측] dot 실효 갱신율 HUD 갱신
+    // draw()는 rAF 루프(맨 아래)가 60fps로 담당 — 폴링에서 중복 호출 제거
   }catch(e){const cl=document.getElementById('c_l');cl.textContent='DOWN';cl.className='down';}
 }
 async function post(u,b){try{const r=await (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json();

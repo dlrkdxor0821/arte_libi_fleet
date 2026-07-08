@@ -43,21 +43,23 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "[run_sim] 이미 실행 중 — attach"; exec tmux attach -t "$SESSION"
 fi
 
-# ① gazebo (sim + GUI + slotcar 3대 + building_map_server)
+# ① gazebo (sim + slotcar 3대 + building_map_server)
+#    기본 headless: Gazebo 3D GUI는 ~1.4코어를 먹어 RTF(sim 속도)를 크게 떨어뜨림 →
+#    관제/디버깅은 웹콘솔(:8001)+RViz로 보므로 GUI는 꺼둔다. 3D 창이 필요하면 SIM_GUI=true ./run_sim.sh
 tmux new-session -d -s "$SESSION" -n gazebo
 tmux set-option -t "$SESSION" remain-on-exit on
 tmux send-keys -t "$SESSION:gazebo" \
-  "$SRC; ros2 launch $REPO/scripts/sim/sim_slotcar3.launch.xml building_yaml:=$BUILDING gui:=true" C-m
+  "$SRC; ros2 launch $REPO/scripts/sim/sim_slotcar3.launch.xml building_yaml:=$BUILDING gui:=${SIM_GUI:-false}" C-m
 
 # ② fleet (FMS) — sim 뜬 뒤
 tmux new-window -t "$SESSION" -n fleet
 tmux send-keys -t "$SESSION:fleet" \
-  "$SRC; sleep 6; ros2 run libi_fleet fleet_node --ros-args -p navgraph_file:=$NAVGRAPH" C-m
+  "$SRC; sleep 12; ros2 run libi_fleet fleet_node --ros-args -p navgraph_file:=$NAVGRAPH" C-m
 
 # ③ 관제 콘솔 (FastAPI :8001) + 브라우저 자동 열기
 tmux new-window -t "$SESSION" -n console
 tmux send-keys -t "$SESSION:console" \
-  "$SRC; sleep 4; cd $REPO/service/aba_service; ( sleep 5 && xdg-open http://localhost:8001 >/dev/null 2>&1 ) & LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001" C-m
+  "$SRC; sleep 4; cd $REPO/service/aba_service; ( sleep 5 && xdg-open http://localhost:8001 >/dev/null 2>&1 ) & LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001 --reload" C-m
 
 # ④ rviz (선택) — slotcar 알고리즘 테스트엔 불필요(costmap/라이다용). GPU 경합으로 콘솔 렉 유발.
 #    필요하면 RVIZ=1 ./run_sim.sh 로만 띄운다.
