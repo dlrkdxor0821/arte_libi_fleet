@@ -1,0 +1,8 @@
+# 배차(Auction) 배터리 완주 관문 파라미터. 콘솔(:8001) "⚙ 배차 파라미터"에서 저장 → fleet 재시작 시 적용.
+# fleet_node 가 --params-file 로 읽는다(이미 declare_parameter 로 선언됨). /** = 모든 노드에 적용.
+# UI 저장 시 yaml.safe_dump 로 덮어써져 이 주석은 사라진다(값만 남음) — 정상.
+/**:
+  ros__parameters:
+    battery_drain_per_m: 1.0     # 주행 1m당 배터리 소비 %
+    battery_drain_per_act: 0.5   # 팔 동작 1회당 배터리 소비 %
+    battery_reserve_pct: 15.0    # 완주 후 남겨둘 최소 배터리 % (플로어)

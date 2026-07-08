@@ -12,6 +12,7 @@ set -uo pipefail
 SESSION="libi"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAVGRAPH="$REPO/libi_fleet/maps/library/new_map.navgraph.yaml"
+ALGO_PARAMS="$REPO/libi_fleet/config/algo_params.yaml"       # 배차 배터리 게이트 파라미터(콘솔에서 저장)
 BUILDING="$REPO/libi_fleet/maps/library/new_map.building.yaml"
 PRACTICE="$HOME/personal_repo/open-rmf-practice"          # pinky 패키지 빌드본(overlay)
 RMF_WS="$HOME/open-rmf-test/rmf_ws"                       # rmf_fleet_msgs / building_map_server
@@ -54,12 +55,12 @@ tmux send-keys -t "$SESSION:gazebo" \
 # ② fleet (FMS) — sim 뜬 뒤
 tmux new-window -t "$SESSION" -n fleet
 tmux send-keys -t "$SESSION:fleet" \
-  "$SRC; sleep 12; ros2 run libi_fleet fleet_node --ros-args -p navgraph_file:=$NAVGRAPH" C-m
+  "$SRC; sleep 12; ros2 run libi_fleet fleet_node --ros-args -p navgraph_file:=$NAVGRAPH --params-file $ALGO_PARAMS" C-m
 
 # ③ 관제 콘솔 (FastAPI :8001) — 브라우저 자동열기 제거(down 때 브라우저 같이 꺼지던 원인). 수동으로 http://localhost:8001 열면 세션과 독립
 tmux new-window -t "$SESSION" -n console
 tmux send-keys -t "$SESSION:console" \
-  "$SRC; sleep 4; cd $REPO/service/aba_service; LIBI_NAVGRAPH=$NAVGRAPH python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001" C-m
+  "$SRC; sleep 4; cd $REPO/service/aba_service; LIBI_NAVGRAPH=$NAVGRAPH LIBI_ALGO_PARAMS=$ALGO_PARAMS python3 -m uvicorn aba_service.console:app --host 0.0.0.0 --port 8001" C-m
 
 # ④ rviz (선택) — slotcar 알고리즘 테스트엔 불필요(costmap/라이다용). GPU 경합으로 콘솔 렉 유발.
 #    필요하면 RVIZ=1 ./run_sim.sh 로만 띄운다.

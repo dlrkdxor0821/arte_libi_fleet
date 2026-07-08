@@ -32,6 +32,18 @@ NAVGRAPH = os.environ.get(
     "LIBI_NAVGRAPH",
     "/home/asd/personal_repo/arte_libi_fleet/libi_fleet/maps/library/new_map.navgraph.yaml")
 
+# 배차(Auction) 배터리 게이트 파라미터 파일. UI에서 저장 → fleet 재시작 시 --params-file 로 로드.
+ALGO_PARAMS = os.environ.get(
+    "LIBI_ALGO_PARAMS",
+    os.path.normpath(os.path.join(os.path.dirname(__file__),
+                                  "../../../libi_fleet/config/algo_params.yaml")))
+# UI 노출 파라미터: key → (라벨, 기본값, 최소, 최대)
+ALGO_SPEC = {
+    "battery_drain_per_m":   ("주행 소비 %/m",    1.0, 0.0, 100.0),
+    "battery_drain_per_act": ("팔동작 소비 %/회", 0.5, 0.0, 100.0),
+    "battery_reserve_pct":   ("완주 예비 %",      15.0, 0.0, 100.0),
+}
+
 ROBOT_MODE = {0: "IDLE", 1: "CHARGING", 2: "MOVING", 3: "PAUSED", 4: "WAITING",
               5: "EMERGENCY", 6: "HOME", 7: "DOCK", 8: "ERROR", 9: "CLEAN"}
 
@@ -98,6 +110,7 @@ class Bridge(Node):
     def _on_state(self, m):
         self.robots[m.name] = {
             "x": round(m.location.x, 3), "y": round(m.location.y, 3),
+            "yaw": round(m.location.yaw, 4),   # 실제 Gazebo heading(rad) → 콘솔 화살표 방향
             "mode": ROBOT_MODE.get(m.mode.mode, str(m.mode.mode)),
             "battery": round(m.battery_percent, 0),
             "task": m.task_id,
@@ -337,6 +350,46 @@ def api_battery(b: BatteryReq):
     return get_bridge().set_battery(b.robot, b.value)
 
 
+def _read_algo_params():
+    """algo_params.yaml 에서 3개 값을 읽어 dict 반환(없거나 깨지면 기본값)."""
+    vals = {k: spec[1] for k, spec in ALGO_SPEC.items()}
+    try:
+        doc = yaml.safe_load(open(ALGO_PARAMS)) or {}
+        ros = (doc.get("/**") or {}).get("ros__parameters", {})
+        for k in ALGO_SPEC:
+            if k in ros:
+                vals[k] = float(ros[k])
+    except FileNotFoundError:
+        pass
+    return vals
+
+
+@app.get("/api/params")
+def api_params_get():
+    return {"params": _read_algo_params(),
+            "spec": {k: {"label": s[0], "min": s[2], "max": s[3]} for k, s in ALGO_SPEC.items()}}
+
+
+@app.post("/api/params")
+def api_params_set(p: dict):
+    """3개 파라미터 검증 후 yaml 저장. fleet 재시작 시 적용."""
+    out = {}
+    for k, (label, default, lo, hi) in ALGO_SPEC.items():
+        if k not in p:
+            return {"ok": False, "reason": f"missing:{k}"}
+        try:
+            v = float(p[k])
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": f"not_number:{k}"}
+        if not (lo <= v <= hi):
+            return {"ok": False, "reason": f"out_of_range:{k} ({lo}~{hi})"}
+        out[k] = v
+    os.makedirs(os.path.dirname(ALGO_PARAMS), exist_ok=True)
+    with open(ALGO_PARAMS, "w") as f:
+        yaml.safe_dump({"/**": {"ros__parameters": out}}, f, default_flow_style=False, sort_keys=False)
+    return {"ok": True, "params": out, "note": "fleet 재시작 시 적용"}
+
+
 @app.post("/api/plugins")
 def api_plugins(p: PluginReq):
     return get_bridge().set_plugins(p.dispatcher, p.traffic)
@@ -465,6 +518,8 @@ td{padding:4px;border-bottom:1px solid #0d2438}
   <aside class="statuspanel">
     <div class="ey">로봇 상태</div>
     <div id="robotcards"></div>
+    <div class="ey" style="margin-top:10px">⚙ 배차 파라미터</div>
+    <div id="algobox" style="padding:6px 14px 14px;display:flex;flex-direction:column;gap:7px"></div>
   </aside>
   <div class="map"><span class="maptag">NAVGRAPH · L1 · world coords (m)</span><span id="meas" style="position:absolute;left:14px;bottom:12px;z-index:5;font-family:var(--mono);font-size:11px;letter-spacing:.03em;color:var(--amber);background:rgba(3,10,18,.55);padding:3px 8px;border:1px solid var(--edge);border-radius:2px">계측 대기… (로봇을 움직여 보세요)</span><canvas id="cv"></canvas></div>
   <aside class="panel">
@@ -572,6 +627,14 @@ function interpRobot(name,now){
   }
   return [nb.x,nb.y];
 }
+// ── heading = 실제 sim yaw 를 업데이트 사이 최단각 이징 → 로봇 실제 방향과 일치 + 매끈 ──
+const RANG={};   // name -> 현재 렌더 각(rad)
+function easeAngle(name,target){
+  let cur=RANG[name];
+  if(cur==null){RANG[name]=target;return target;}
+  let d=target-cur; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI;
+  cur+=d*0.2; RANG[name]=cur; return cur;   // 0.2/프레임 ≈ 150ms 안정
+}
 function trimRoute(pw,rx,ry){   // 로봇 위치를 경로에 투영 → 지나온 앞부분 잘라 [투영점, 남은 waypoint...] 반환
   let bi=0,bx=pw[0][0],by=pw[0][1],bd=Infinity;
   for(let i=0;i<pw.length-1;i++){
@@ -643,9 +706,8 @@ function draw(){
     const c=cols[name]||'#c66bff';
     let p=interpRobot(name,now)||[r.x,r.y];   // 버퍼드 엔티티 보간
     const rpw=(S.routes||{})[name];
-    let ang=null;
-    if(rpw&&rpw.length>=2){const tr=trimRoute(rpw,p[0],p[1]);p=tr[0];   // 간선 위로 투영
-      if(tr.length>=2){const nb=tr[1];ang=Math.atan2(Y(nb[1])-Y(p[1]),X(nb[0])-X(p[0]));}}   // 다음 노드 방향=heading
+    if(rpw&&rpw.length>=2){const tr=trimRoute(rpw,p[0],p[1]);p=tr[0];}   // 위치는 간선 위로 투영
+    const ang=(r.yaw!=null)?easeAngle(name,-r.yaw):null;   // heading=실제 sim yaw(캔버스 Y반전→-yaw), 업데이트 사이 이징
     const px=X(p[0]),py=Y(p[1]);
     if(ang!=null){   // 방향 삼각형(▷): 로봇이 향하는 방향
       ctx.save();ctx.translate(px,py);ctx.rotate(ang);
@@ -777,6 +839,29 @@ function saveNg(){post('/api/navgraph/save',{});}
 function delVertex(){if(sel<0){log('삭제할 정점을 먼저 클릭해 선택하세요',true);return;}post('/api/vertex/del',{index:sel}).then(()=>{sel=-1;});}
 cv.addEventListener('contextmenu',e=>{if(!edit||!T)return;e.preventDefault();const[cx,cy]=epos(e);const vi=nearV(cx,cy);if(vi>=0){post('/api/vertex/del',{index:vi}).then(()=>{if(sel===vi)sel=-1;else if(sel>vi)sel--;});}});
 addEventListener('resize',draw);
+// ── ⚙ 배차 파라미터 (fleet 재시작 시 적용) ──
+async function loadParams(){
+  try{const r=await (await fetch('/api/params')).json();
+    const box=document.getElementById('algobox');
+    box.innerHTML=Object.entries(r.spec).map(([k,s])=>
+      `<label style="font-size:11px;color:#8fb4cf;display:flex;flex-direction:column;gap:3px">${s.label}`+
+      `<input id="ap_${k}" type="number" step="0.1" min="${s.min}" max="${s.max}" value="${r.params[k]}"`+
+      ` style="width:100%;box-sizing:border-box;padding:5px;background:#0a2236;color:#cfe6f5;border:1px solid #24506e;border-radius:5px"></label>`
+    ).join('')+
+      `<button class="go" style="width:100%;margin-top:2px" onclick="saveParams()">저장</button>`+
+      `<div id="ap_hint" class="hint" style="margin-top:2px">값 저장 후 <b>fleet 재시작</b> 시 적용됩니다.</div>`;
+    box._keys=Object.keys(r.spec);
+  }catch(e){document.getElementById('algobox').innerHTML='<div class="hint" style="color:var(--down)">파라미터 로드 실패</div>';}
+}
+async function saveParams(){
+  const box=document.getElementById('algobox'), body={};
+  (box._keys||[]).forEach(k=>body[k]=parseFloat(val('ap_'+k)));
+  const r=await post('/api/params',body);
+  const h=document.getElementById('ap_hint');
+  if(r&&r.ok){h.innerHTML='✔ 저장됨 · <b>fleet 재시작</b>(./run_sim.sh down &amp;&amp; ./run_sim.sh) 시 적용';h.style.color='var(--up)';}
+  else if(r){h.textContent='저장 실패: '+(r.reason||'?');h.style.color='var(--down)';}
+}
+loadParams();
 setInterval(poll,100);poll();   // UI 갱신 10Hz (빠른 갱신)
 (function anim(){draw();requestAnimationFrame(anim);})();   // 경로 흐름 애니메이션
 log('console ready — 대상/목표 선택 후 명령하세요.');

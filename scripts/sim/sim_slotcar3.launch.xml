@@ -27,7 +27,10 @@
     <include file="$(find-pkg-share pinky_description)/launch/upload_robot.launch.py">
         <arg name='use_sim_time' value='True'/>
         <arg name='is_sim' value='True'/>
-        <arg name='description_file' value='urdf/pinky_slotcar.urdf.xacro'/>
+        <!-- upload_robot.launch.py 는 description_file 을 안 읽고 drive 인자로 분기한다.
+             drive:=slotcar → 핑키 URDF(robot.urdf.xacro) 그대로 + libslotcar.so 얹어 /robot_state 발행.
+             기본값 diffdrive 로 두면 slotcar 플러그인 미탑재 → /robot_state 무발행(콘솔에 로봇 안 뜸). -->
+        <arg name='drive' value='slotcar'/>
     </include>
 
     <!-- 외곽 루프 순회: 세 대를 루프 위 서로 다른 지점에 스폰 -->

@@ -108,6 +108,10 @@ sim launch 파일은 `libi_rmf_*` 를 참조하지 않는데도 이 에러가 �
 - 이러면 Gazebo 가 뜨고, 맵 서빙 + slotcar 3대 스폰 + 물리(/clock) 진행까지 확인됨.
 
 ### (C) Gazebo 창이 안 뜸 / `/robot_state` 안 나옴 — GPU 렌더링
+> ⚠️ **`/robot_state` 가 안 나온다면 GPU보다 drive 모드를 먼저 의심하라** → [`docs/트러블슈팅.md`](docs/트러블슈팅.md).
+> `libEGL warning: ... driver (null)` 는 대개 Mesa→NVIDIA 폴백 노이즈일 뿐(카메라는 실제 초기화됨).
+> GPU가 진짜 원인인 건 3D 창/센서 렌더가 통째로 죽는 경우다.
+
 로그에 `libEGL warning: ... driver (null)` · `egl: failed to create dri2 screen` 가 보이면
 **GPU 드라이버가 렌더링에 안 잡히는 것**(예: 원격/헤드리스 세션, NVIDIA 드라이버 미설정).
 - 물리는 돌지만 slotcar 센서/렌더가 초기화 못 해 `/robot_state` 가 안 나올 수 있다.
