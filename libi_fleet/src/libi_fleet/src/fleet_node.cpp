@@ -20,6 +20,7 @@
 #include <rmf_fleet_msgs/msg/location.hpp>
 
 #include "libi_fleet/navgraph.hpp"
+#include "libi_fleet/patrol_cycle.hpp"
 #include "libi_fleet/fms_types.hpp"
 #include "libi_fleet/dispatcher_base.hpp"
 #include "libi_fleet/traffic_base.hpp"
@@ -46,6 +47,7 @@ constexpr int kSeqMax   = 100000;        // 나이 정규화 상한(세션 태�
 constexpr int kStopPrio = 4 * kTierStep; // STOP 장애물(사다리 밖, 항상 최상위)
 constexpr int kMaxReroutes = 3;          // 교착 우회 최대 연속 횟수 — 초과 시 우회 포기·escalate(livelock 방지)
 constexpr int kStuckTicks  = 100;        // 이동 지시됐는데 무진행이 이 틱(≈15s@150ms) 넘으면 slotcar stuck으로 보고 task 취소
+constexpr int kRerouteWaitTicks = 33;    // 일반 WAIT 가 이 틱(≈5s@150ms) 넘으면 우회 재탐색(작업·순회)
 
 struct ActiveTask
 {
@@ -63,6 +65,7 @@ struct ActiveTask
   int reroutes{0};         // 연속 우회 횟수(노드 도달 시 리셋). 초과 시 우회 포기·escalate → livelock 방지.
   double last_x{0}, last_y{0};   // 직전 틱 위치 — 무진행(stuck) 감지용
   int no_move{0};          // 이동 지시 상태에서 무진행 틱 수
+  int wait_ticks{0};       // 일반 WAIT 지속 틱 수(타임드 우회용). 진전 시 0 리셋.
 };
 
 class FleetNode : public rclcpp::Node
@@ -86,8 +89,8 @@ public:
 
     // 순회(patrol) 모드: 켜지면 idle 로봇이 patrol_route(외곽 루프)를 무한 순회.
     patrol_ = declare_parameter<bool>("patrol", true);
-    const std::string route_s = declare_parameter<std::string>("patrol_route", "0 1 2 3 7 6 5 4");
-    { std::stringstream ss(route_s); int v; while (ss >> v) { patrol_route_.push_back(v); } }
+    // "auto"(기본) → 우/하 우선 규칙으로 순회 루프 생성(그래프 로드 후). 그 외는 수동 정점 목록.
+    const std::string route_s = declare_parameter<std::string>("patrol_route", "auto");
 
     if (!graph_.load(navgraph_file_)) {
       RCLCPP_FATAL(get_logger(), "navgraph 로드 실패: %s", navgraph_file_.c_str());
@@ -99,6 +102,21 @@ public:
     traffic_ = traf_loader_.createSharedInstance(traf_name);
     RCLCPP_INFO(get_logger(), "plugins: dispatcher=%s traffic=%s | navgraph=%d verts",
                 disp_name.c_str(), traf_name.c_str(), graph_.size());
+
+    // 순회 루프 확정: "auto" 면 우/하 우선 규칙으로 생성, 아니면 수동 정점 목록 파싱.
+    if (route_s == "auto") {
+      patrol_route_ = right_hand_boundary_cycle(graph_);
+      if (patrol_route_.size() < 2) {   // 생성 실패 → 안전 fallback
+        RCLCPP_WARN(get_logger(), "patrol_route auto 생성 실패 → 기본 루프 사용");
+        patrol_route_ = {0, 1, 2, 3, 7, 6, 5, 4};
+      }
+    } else {
+      std::stringstream ss(route_s); int v; while (ss >> v) { patrol_route_.push_back(v); }
+    }
+    {
+      std::string s; for (int v : patrol_route_) { s += std::to_string(v) + " "; }
+      RCLCPP_INFO(get_logger(), "순회 루프(우/하 우선): %s", s.c_str());
+    }
 
     state_sub_ = create_subscription<RmfRobotState>(
       "/robot_state", 10,
@@ -267,9 +285,11 @@ private:
         t.idx++;
         t.moving = false;
         t.reroutes = 0;   // 노드 도달 = 진전 → 우회 카운터 리셋
+        t.wait_ticks = 0;   // 노드 도달 = 진전 → 타임드 우회 카운터 리셋
         if (t.idx >= t.path.size()) {
           if (t.patrol) {
-            t.idx = 1;   // 루프 계속 (path.back()==path[0] 소유 상태 → 아래 이동블록으로)
+            t.path = make_patrol_path(r, -1);   // 현재 위치서 canonical 랩 재생성(방향 유지)
+            t.idx = 1; t.moving = false;
             RCLCPP_INFO(get_logger(), "[%s] %s 순회 1바퀴 → 계속", t.id.c_str(), t.robot.c_str());
           } else {
             traffic_->release_node(t.robot, t.path.back());     // 최종 노드 해제
@@ -289,12 +309,13 @@ private:
         if (dec == MoveDecision::GRANT) {
           if (cur != next) { traffic_->release_node(t.robot, cur); }   // 출발 순간 이전 노드 해제 (cur==next=start==goal 케이스는 목표 유지)
           send_path(t.robot, r.x, r.y, graph_.vertex(next));
-          t.moving = true; t.wait_logged = false; t.stuck = false;   // 풀림 → escalation 해제
+          t.moving = true; t.wait_logged = false; t.stuck = false; t.wait_ticks = 0;   // 풀림 → escalation 해제
           RCLCPP_INFO(get_logger(), "[%s] %s → v%d (GRANT)", t.id.c_str(), t.robot.c_str(), next);
         } else if (dec == MoveDecision::DEADLOCK) {
           // 우회는 kMaxReroutes 번까지만(livelock 방지). 초과하면 우회 포기 → escalate + 대기.
-          auto reroute = (t.reroutes < kMaxReroutes)
-                       ? graph_.dijkstra(cur, t.path.back(), next) : std::vector<int>{};   // next 를 피해 우회
+          int goal_node = t.patrol ? patrol_succ(next) : t.path.back();   // 순회는 방향 유지(막힌 노드 다음)
+          auto reroute = (t.reroutes < kMaxReroutes && goal_node >= 0)
+                       ? graph_.dijkstra(cur, goal_node, next) : std::vector<int>{};   // next 를 피해 우회
           if (reroute.size() >= 2) {
             t.reroutes++;
             RCLCPP_WARN(get_logger(), "[%s] %s ⚠ 교착 감지(v%d) → 우회 %zu nodes (재시도 %d/%d)",
@@ -320,10 +341,28 @@ private:
                            t.id.c_str(), t.robot.c_str(), next);
               t.wait_logged = true;
             }
-          } else if (!t.wait_logged) {
-            publish_task_state(t.id, "EXECUTING", t.robot);
-            RCLCPP_WARN(get_logger(), "[%s] %s ⏸ v%d 점유중 → 양보 대기", t.id.c_str(), t.robot.c_str(), next);
-            t.wait_logged = true;
+          } else {
+            // 일반 WAIT(움직이는 로봇이 점유). 오래 안 풀리면 타임드 우회(작업·순회 모두).
+            t.wait_ticks++;
+            if (!t.wait_logged) {
+              publish_task_state(t.id, "EXECUTING", t.robot);
+              RCLCPP_WARN(get_logger(), "[%s] %s ⏸ v%d 점유중 → 양보 대기", t.id.c_str(), t.robot.c_str(), next);
+              t.wait_logged = true;
+            }
+            if (t.wait_ticks >= kRerouteWaitTicks) {
+              int goal_node = t.patrol ? patrol_succ(next) : t.path.back();   // 순회는 방향 유지
+              auto reroute = (goal_node >= 0) ? graph_.dijkstra(cur, goal_node, next)
+                                              : std::vector<int>{};
+              if (reroute.size() >= 2) {
+                RCLCPP_WARN(get_logger(), "[%s] %s ⤴ %ds 대기 → 우회 %zu nodes (v%d 회피)",
+                            t.id.c_str(), t.robot.c_str(), (kRerouteWaitTicks * 150 + 500) / 1000,
+                            reroute.size(), next);
+                t.path = reroute; t.idx = 1; t.moving = false; t.wait_logged = false;
+                t.wait_ticks = 0;
+              } else {
+                t.wait_ticks = 0;   // 우회 불가 → 카운터만 리셋, 계속 대기(다음 주기 재시도)
+              }
+            }
           }
         }
       }
@@ -464,20 +503,38 @@ private:
     if (r != robots_.end()) { r->second.busy = false; r->second.task_id.clear(); }
   }
 
-  // 로봇을 외곽 루프(patrol_route)에 태워 무한 순회 시작.
-  void start_patrol(RobotInfo & r)
+  // canonical 순회 루프에서 node 의 다음 노드. node 가 루프에 없으면 -1.
+  int patrol_succ(int node) const
   {
-    size_t k = 0; double bd = 1e18;   // 로봇에서 가장 가까운 순회 정점을 진입점으로
-    for (size_t i = 0; i < patrol_route_.size(); ++i) {
+    const int n = static_cast<int>(patrol_route_.size());
+    for (int i = 0; i < n; ++i) {
+      if (patrol_route_[i] == node) { return patrol_route_[(i + 1) % n]; }
+    }
+    return -1;
+  }
+
+  // 현재 위치에서 canonical 방향으로 한 바퀴 랩 경로 생성(가장 가까운 정점 진입 → 정방향).
+  // avoid_first>=0 이면 진입점의 다음 홉이 그 노드일 때 한 칸 앞에서 시작(방향은 유지).
+  std::vector<int> make_patrol_path(const RobotInfo & r, int avoid_first) const
+  {
+    const size_t n = patrol_route_.size();
+    size_t k = 0; double bd = 1e18;   // 가장 가까운 순회 정점 = 진입점
+    for (size_t i = 0; i < n; ++i) {
       const Vertex & v = graph_.vertex(patrol_route_[i]);
       double dd = std::hypot(r.x - v.x, r.y - v.y);
       if (dd < bd) { bd = dd; k = i; }
     }
-    const size_t n = patrol_route_.size();
+    if (avoid_first >= 0 && patrol_route_[(k + 1) % n] == avoid_first) { k = (k + 1) % n; }
     std::vector<int> path;
     for (size_t i = 0; i < n; ++i) { path.push_back(patrol_route_[(k + i) % n]); }
     path.push_back(patrol_route_[k]);   // 루프 닫기(마지막==처음)
+    return path;
+  }
 
+  // 로봇을 외곽 루프(patrol_route)에 태워 무한 순회 시작.
+  void start_patrol(RobotInfo & r)
+  {
+    std::vector<int> path = make_patrol_path(r, -1);
     r.busy = true;
     std::string tid = "P-" + r.name;
     r.task_id = tid;
@@ -488,7 +545,7 @@ private:
     tasks_.push_back(t);
     publish_task_state(tid, "PATROL", r.name);
     RCLCPP_INFO(get_logger(), "[%s] %s 순회 시작 (진입 v%d, %zu nodes)",
-                tid.c_str(), r.name.c_str(), patrol_route_[k], n);
+                tid.c_str(), r.name.c_str(), path[0], path.size());
   }
 
   void on_set_plugins(const std::shared_ptr<SetPlugins::Request> req,

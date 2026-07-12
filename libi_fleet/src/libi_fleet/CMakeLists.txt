@@ -14,7 +14,7 @@ find_package(std_srvs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 # --- core 라이브러리 (navgraph) ---
-add_library(libi_fleet_core src/navgraph.cpp)
+add_library(libi_fleet_core src/navgraph.cpp src/patrol_cycle.cpp)
 set_property(TARGET libi_fleet_core PROPERTY POSITION_INDEPENDENT_CODE ON)  # shared 플러그인에 링크되므로 PIC
 target_include_directories(libi_fleet_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -48,5 +48,15 @@ install(TARGETS libi_fleet_core libi_fleet_plugins
   RUNTIME DESTINATION bin)
 install(TARGETS fleet_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_patrol_cycle test/test_patrol_cycle.cpp)
+  target_include_directories(test_patrol_cycle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(test_patrol_cycle libi_fleet_core)
+  target_compile_definitions(test_patrol_cycle PRIVATE
+    TEST_NAVGRAPH_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../maps/library/new_map.navgraph.yaml")
+endif()
 
 ament_package()

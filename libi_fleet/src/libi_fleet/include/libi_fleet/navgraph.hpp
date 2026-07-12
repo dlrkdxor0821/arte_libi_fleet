@@ -18,6 +18,8 @@ public:
   // from→to 정점 인덱스 경로(시작·끝 포함). 경로 없으면 빈 벡터.
   // avoid>=0 이면 그 정점을 통과하지 않는 경로(데드락 우회용).
   std::vector<int> dijkstra(int from, int to, int avoid = -1) const;
+  // 정점 i 의 인접 정점 인덱스 목록(경계 순회 등 그래프 순회용).
+  const std::vector<int> & neighbors(int i) const { return adj_.at(i); }
 
 private:
   std::vector<Vertex> vertices_;
