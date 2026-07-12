@@ -141,10 +141,11 @@ class Bridge(Node):
         except Exception:
             pass
 
-    def submit(self, goal, robot="", priority=0, arm_actions=0):
+    def submit(self, goal, robot="", priority=0, arm_actions=0, name=""):
         if not self.task_cli.wait_for_service(timeout_sec=2.0):
             return {"accepted": False, "reason": "fleet_unavailable"}
         req = SubmitTask.Request(task_type="delivery", dropoff=str(goal), robot=robot,
+                                 requester=str(name).strip(),   # 커스텀 작업 이름(비우면 자동 T-N)
                                  priority=int(priority), arm_actions=int(arm_actions))
         r = _spin_future(self, self.task_cli.call_async(req))
         if r is None:
@@ -293,6 +294,7 @@ class TaskReq(BaseModel):
     priority: int = 0
     robot: str = ""
     arm_actions: int = 0
+    name: str = ""
 
 
 class PluginReq(BaseModel):
@@ -318,7 +320,7 @@ def api_map():
 
 @app.post("/api/task")
 def api_task(t: TaskReq):
-    return get_bridge().submit(t.goal, t.robot, t.priority, t.arm_actions)
+    return get_bridge().submit(t.goal, t.robot, t.priority, t.arm_actions, t.name)
 
 
 class ModeReq(BaseModel):
@@ -525,6 +527,9 @@ td{padding:4px;border-bottom:1px solid #0d2438}
   <aside class="panel">
     <div class="grp">
       <div class="ey">① 특정 로봇 배차</div>
+      <label>작업 이름 (선택 · 비우면 자동 T-N)</label>
+      <input id="t_name" type="text" placeholder="예: 3층 책배달"
+             style="width:100%;box-sizing:border-box;padding:6px;background:#0a2236;color:#cfe6f5;border:1px solid #24506e;border-radius:6px">
       <label>로봇</label><select id="t_robot"></select>
       <label>목적지 정점</label><select id="t_vertex"></select>
       <label>task 우선도 (참고용)</label>
@@ -538,6 +543,9 @@ td{padding:4px;border-bottom:1px solid #0d2438}
     </div>
     <div class="grp">
       <div class="ey">② 자동 배차 · 경매</div>
+      <label>작업 이름 (선택 · 비우면 자동 T-N)</label>
+      <input id="a_name" type="text" placeholder="예: 반납정리"
+             style="width:100%;box-sizing:border-box;padding:6px;background:#0a2236;color:#cfe6f5;border:1px solid #24506e;border-radius:6px">
       <label>목적지 정점</label><select id="a_vertex"></select>
       <label>task 우선도 (참고용)</label>
       <input id="a_prio" type="number" value="0" min="0" max="9"
@@ -740,21 +748,29 @@ function taskState(taskId){   // S.tasks(최신순)에서 이 task의 현재 상
   for(const t of S.tasks)if(t.task_id===taskId)return t.state;
   return '';
 }
+function curTask(n){   // 이 로봇의 현재 '배차' 작업(피드 최신순, 순회 P- 제외) → {task_id,state}
+  if(!S.tasks)return null;
+  for(const t of S.tasks)if(t.robot===n&&!String(t.task_id).startsWith('P-'))return t;
+  return null;
+}
 function renderCards(){
   if(!S)return; const cols={pinky1:'#ff5d62',pinky2:'#36d98a',pinky3:'#4ea3ff'};
   const rn=Object.keys(S.robots).sort();
   document.getElementById('robotcards').innerHTML = rn.map(n=>{
-    const r=S.robots[n],c=cols[n]||'#c66bff',b=Math.round(r.battery),bc=battColor(b),st=taskState(r.task);
+    const r=S.robots[n],c=cols[n]||'#c66bff',b=Math.round(r.battery),bc=battColor(b);
     const ni=robotNextNode(n), nl=(ni!=null)?('v'+ni):'—';                             // 다음 목적지(노드)
     const gv=(S.goals&&S.goals[n]!=null)?S.goals[n]:null, gl=(gv!=null)?('v'+gv):'—';  // 최종 목적지 = fleet /fms/goals(배차만; 순회는 없음)
     const hasRoute=(S.routes&&S.routes[n]&&S.routes[n].length>=2);   // 상태 칩: STOP·CHARGE 우선 → 배차중 → 경로있음=순회 → 없음=대기
     const mc = r.fleet_mode==='STOP'?['정지','#ff7a7a'] : r.fleet_mode==='CHARGE'?['충전복귀','#c66bff']
              : gv!=null?['배차','#ffb65c'] : hasRoute?['순회','#4ea3ff'] : ['대기','#6f93ab'];
+    const at=curTask(n);   // 작업 행: 배차되면 작업명(+상태), 순회 중이면 '순회', 그 외 '—'
+    const job = (gv!=null) ? (at ? at.task_id+(at.state?' · '+at.state:'') : '배차 중')
+              : hasRoute ? '순회' : '—';
     return `<div class="rcard" style="border-left-color:${c}">
       <div class="rc-h"><span class="dot" style="background:${c}"></span>${n}<span class="rc-m" style="background:${mc[1]}22;color:${mc[1]}">${mc[0]}</span></div>
       <div class="batt"><i style="width:${b}%;background:${bc}"></i></div>
       <div class="rc-row"><span>배터리</span><b style="color:${bc}">${b}%</b></div>
-      <div class="rc-row"><span>작업</span><b>${r.task||'—'}${st?' · '+st:''}</b></div>
+      <div class="rc-row"><span>작업</span><b>${job}</b></div>
       <div class="rc-row"><span>다음 목적지</span><b style="color:${ni!=null?c:'var(--dim)'}">${nl}</b></div>
       <div class="rc-row"><span>최종 목적지</span><b style="color:${gv!=null?c:'var(--dim)'}">${gl}</b></div>
       <div class="rc-row"><span>위치</span><b>${r.x.toFixed(1)}, ${r.y.toFixed(1)}</b></div>
@@ -805,12 +821,12 @@ async function post(u,b){try{const r=await (await fetch(u,{method:'POST',headers
   catch(e){log('요청 실패: '+u,true);}}
 function val(id){const e=document.getElementById(id);return e?e.value:'';}
 function ival(id){return parseInt(val(id))||0;}
-function doTaskRobot(){post('/api/task',{goal:ival('t_vertex'),robot:val('t_robot'),priority:ival('t_prio'),arm_actions:ival('t_arm')});}
+function doTaskRobot(){post('/api/task',{goal:ival('t_vertex'),robot:val('t_robot'),priority:ival('t_prio'),arm_actions:ival('t_arm'),name:val('t_name')});}
 function doMode(m){post('/api/mode',{robot:val('s_robot'),mode:m});}
 function doBattery(){post('/api/battery',{robot:val('s_robot'),value:parseFloat(val('bat'))});}
-let bidGoal=null,bidPrio=0,bidArm=0;
+let bidGoal=null,bidPrio=0,bidArm=0,bidName='';
 async function doTaskDisp(){   // 자동배차: 경매 점수 팝업 후 배차
-  const v=ival('a_vertex'); bidGoal=v; bidPrio=ival('a_prio'); bidArm=ival('a_arm');
+  const v=ival('a_vertex'); bidGoal=v; bidPrio=ival('a_prio'); bidArm=ival('a_arm'); bidName=val('a_name');
   const r=await (await fetch('/api/bids',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal:v})})).json();
   const cols={pinky1:'#ff5d62',pinky2:'#36d98a',pinky3:'#4ea3ff'};
   const rows=r.bids.map(b=>{const win=b.robot===r.winner;return `<tr style="border-top:1px solid #16324a">`+
@@ -822,7 +838,7 @@ async function doTaskDisp(){   // 자동배차: 경매 점수 팝업 후 배차
   document.getElementById('bidModal').style.display='flex';
 }
 function closeBids(){document.getElementById('bidModal').style.display='none';}
-function confirmBids(){closeBids();post('/api/task',{goal:bidGoal,priority:bidPrio,arm_actions:bidArm});}
+function confirmBids(){closeBids();post('/api/task',{goal:bidGoal,priority:bidPrio,arm_actions:bidArm,name:bidName});}
 // ── 정점 편집 ──
 function epos(e){const r=cv.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top];}
 function c2w(cx,cy){return[T.xmin+(cx-T.ox)/T.s, T.ymin+(T.H-cy-T.oy)/T.s];}

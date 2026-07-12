@@ -210,7 +210,10 @@ private:
     }
     if (r.busy) { cancel_task(robot); }   // 순회/기존 task 취소하고 이 배차로 대체 (특정 배차·경매 낙찰 공통)
     r.busy = true;
-    std::string tid = "T-" + std::to_string(++task_counter_);
+    // 콘솔이 지정한 커스텀 작업 이름(requester 필드에 실려옴). 비우면 자동 T-N.
+    std::string tid = req->requester.empty()
+                        ? ("T-" + std::to_string(++task_counter_))
+                        : req->requester;
     r.task_id = tid;
     ActiveTask t; t.id = tid; t.robot = robot; t.path = path; t.idx = 1; t.moving = false;
     t.priority = req->priority;
