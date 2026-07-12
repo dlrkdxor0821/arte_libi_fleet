@@ -19,6 +19,7 @@
 #include <rmf_fleet_msgs/msg/path_request.hpp>
 #include <rmf_fleet_msgs/msg/location.hpp>
 
+#include "libi_fleet/fleet_task.hpp"
 #include "libi_fleet/navgraph.hpp"
 #include "libi_fleet/patrol_cycle.hpp"
 #include "libi_fleet/fms_types.hpp"
@@ -36,37 +37,6 @@ using RmfLocation = rmf_fleet_msgs::msg::Location;
 
 namespace libi_fleet
 {
-
-constexpr double kArrive = 0.35;   // 도착 판정 거리(m)
-
-// 교통 우선순위 인코딩(단일 int): tier(가장 큼) > task 나이(오래된=큼) > 배터리(낮은=큼).
-//   tier: 순회=0 · 작업=1 · 충전복귀(CHARGE)=2 · 완전막힘(STUCK, 동적)=3
-constexpr int kTierStep = 50000000;      // tier 간 간격 (age 최대치 kSeqMax*kAgeStep 보다 큼)
-constexpr int kAgeStep  = 128;           // task 나이 1스텝 (배터리 최대 100 보다 큼)
-constexpr int kSeqMax   = 100000;        // 나이 정규화 상한(세션 태스크 수 가정)
-constexpr int kStopPrio = 4 * kTierStep; // STOP 장애물(사다리 밖, 항상 최상위)
-constexpr int kMaxReroutes = 3;          // 교착 우회 최대 연속 횟수 — 초과 시 우회 포기·escalate(livelock 방지)
-constexpr int kStuckTicks  = 100;        // 이동 지시됐는데 무진행이 이 틱(≈15s@150ms) 넘으면 slotcar stuck으로 보고 task 취소
-constexpr int kRerouteWaitTicks = 33;    // 일반 WAIT 가 이 틱(≈5s@150ms) 넘으면 우회 재탐색(작업·순회)
-
-struct ActiveTask
-{
-  std::string id;
-  std::string robot;
-  std::vector<int> path;   // 정점 인덱스 경로(시작 포함)
-  size_t idx{1};           // 현재 향하는 path 인덱스
-  bool moving{false};
-  bool wait_logged{false};
-  bool patrol{false};      // 순회 task: 끝에 도달해도 완료 안 하고 루프 반복
-  bool stuck{false};       // 완전 막힘(우회 실패) → 우선순위 top 으로 escalate, 풀리면 원복
-  int priority{0};         // (참고용) UI 지정 우선도. 교통 우선순위는 compute_priority 가 계산.
-  int start_seq{0};        // 생성 순서(작을수록 오래됨) — 우선순위 나이 tiebreak
-  int arm_actions{0};      // 팔 동작 횟수(배터리 소비 추정용)
-  int reroutes{0};         // 연속 우회 횟수(노드 도달 시 리셋). 초과 시 우회 포기·escalate → livelock 방지.
-  double last_x{0}, last_y{0};   // 직전 틱 위치 — 무진행(stuck) 감지용
-  int no_move{0};          // 이동 지시 상태에서 무진행 틱 수
-  int wait_ticks{0};       // 일반 WAIT 지속 틱 수(타임드 우회용). 진전 시 0 리셋.
-};
 
 class FleetNode : public rclcpp::Node
 {
@@ -221,7 +191,7 @@ private:
       res->accepted = false; res->reason = "no_path"; return;   // 진짜 도달 불가만 거절
     }
     // 완주 가능성 관문(강제 배정도 포함 — 방전 좌초 방지). 자동배차는 dispatcher 가 이미 필터.
-    double need = path_cost(path) * energy_.drain_per_m
+    double need = graph_.path_cost(path) * energy_.drain_per_m
                 + arm_actions * energy_.drain_per_act + energy_.reserve;
     if (r.battery < need) {
       res->accepted = false; res->reason = "insufficient_battery"; return;
@@ -261,6 +231,7 @@ private:
     for (auto it = tasks_.begin(); it != tasks_.end();) {
       ActiveTask & t = *it;
       RobotInfo & r = robots_[t.robot];
+
       const Vertex & tv = graph_.vertex(t.path[t.idx]);
       double d = std::hypot(r.x - tv.x, r.y - tv.y);
 
@@ -447,18 +418,6 @@ private:
     return it == robots_.end() ? 100.0 : it->second.battery;
   }
 
-  // 경로(정점 인덱스)의 실제 주행거리(m).
-  double path_cost(const std::vector<int> & path) const
-  {
-    double c = 0.0;
-    for (size_t i = 1; i < path.size(); ++i) {
-      const Vertex & a = graph_.vertex(path[i - 1]);
-      const Vertex & b = graph_.vertex(path[i]);
-      c += std::hypot(a.x - b.x, a.y - b.y);
-    }
-    return c;
-  }
-
   // 교통 우선순위(단일 int): tier(가장 큼) > task 나이(오래된=큼) > 배터리(낮은=큼).
   //   tier: 순회=0 · 작업=1 · 충전복귀(CHARGE)=2 · 완전막힘(STUCK,동적)=3
   int compute_priority(const std::string & robot, const ActiveTask & t) const
@@ -638,7 +597,7 @@ private:
   std::string fleet_name_;
   bool patrol_{false};
   std::vector<int> patrol_route_;
-  std::map<std::string, std::string> robot_mode_;   // 로봇 → PATROL|IDLE|STOP
+  std::map<std::string, std::string> robot_mode_;   // 로봇 → PATROL|IDLE|STOP|CHARGE
   std::map<std::string, RobotInfo> robots_;
   std::vector<ActiveTask> tasks_;
   EnergyParams energy_;             // 배터리 소비 모델(완주 가능성 관문)

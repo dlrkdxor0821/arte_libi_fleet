@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # run_sim.sh — Gazebo + RViz + fleet(FMS) + 관제 콘솔을 tmux 한 세션으로 한 번에 띄운다.
 #
-#   ./run_sim.sh          # up    : 세션 시작 후 attach (이미 떠있으면 attach)
+#   ./run_sim.sh          # up    : 세션 시작 후 attach (이미 떠있으면 attach, Gazebo GUI 꺼짐/headless)
+#   ./run_sim.sh view     # up + Gazebo 3D GUI 켜기 (SIM_GUI=true 와 동일)
 #   ./run_sim.sh down     # down  : tmux 세션 + 잔여 gz/bridge/노드 정리
 #   ./run_sim.sh status   # status: 세션/윈도우 상태
 #
@@ -31,6 +32,8 @@ CLEANUP=("gz sim" "ruby .*gz sim" "building_map_server" "parameter_bridge" \
 command -v tmux >/dev/null || { echo "[run_sim] tmux 미설치 → sudo apt install tmux"; exit 1; }
 
 case "${1:-up}" in
+  view)
+    export SIM_GUI=true ;;   # Gazebo 3D GUI 켠 채로 아래 정상 기동으로 진행
   down)
     tmux kill-session -t "$SESSION" 2>/dev/null && echo "[run_sim] 세션 종료"
     for p in "${CLEANUP[@]}"; do pkill -9 -f "$p" 2>/dev/null; done

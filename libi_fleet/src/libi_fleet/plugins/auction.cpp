@@ -31,7 +31,7 @@ public:
       int start = g.nearest(r.x, r.y);
       auto path = g.dijkstra(start, goal);
       if (start != goal && path.size() < 2) { continue; }   // 도달 불가 → 입찰 포기
-      double dist = path_cost(path, g);          // 실제 주행거리(m)
+      double dist = g.path_cost(path);           // 실제 주행거리(m)
 
       // 완주 가능성 관문(배터리로만): 작업 끝내고도 reserve 위에 남는가?
       double need = dist * e.drain_per_m + arm_actions * e.drain_per_act + e.reserve;
@@ -41,18 +41,6 @@ public:
       if (bid < best) { best = bid; winner = r.name; }
     }
     return winner;   // 없으면 "" (거절)
-  }
-
-private:
-  static double path_cost(const std::vector<int> & path, const Navgraph & g)
-  {
-    double c = 0.0;
-    for (size_t i = 1; i < path.size(); ++i) {
-      const Vertex & a = g.vertex(path[i - 1]);
-      const Vertex & b = g.vertex(path[i]);
-      c += std::hypot(a.x - b.x, a.y - b.y);
-    }
-    return c;
   }
 };
 
